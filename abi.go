@@ -8,6 +8,7 @@ import "C"
 import (
 	"encoding/json"
 	"errors"
+	"path/filepath"
 	"unsafe"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
@@ -116,11 +117,33 @@ func (h *nativeHost) List() ([]pluginapi.HostAuthFileEntry, error) {
 	return result.Files, err
 }
 
-func (h *nativeHost) Get(index string) (json.RawMessage, error) {
+func (h *nativeHost) Get(index string) (string, json.RawMessage, error) {
 	var result pluginapi.HostAuthGetResponse
-	err := h.call(pluginabi.MethodHostAuthGet, pluginapi.HostAuthGetRequest{AuthIndex: index}, &result)
-	if err == nil && result.AuthIndex != index {
-		return nil, errors.New("credential_identity_mismatch")
+	if err := h.call(pluginabi.MethodHostAuthGet, pluginapi.HostAuthGetRequest{AuthIndex: index}, &result); err != nil {
+		return "", nil, err
 	}
-	return result.JSON, err
+	if result.AuthIndex != index {
+		return "", nil, errors.New("credential_identity_mismatch")
+	}
+	// The host saves by base name into the auth directory, so a name that differs from the
+	// backing file would write a second file instead of updating this one.
+	if result.Path != "" && filepath.Base(result.Path) != result.Name {
+		return "", nil, errors.New("credential_name_mismatch")
+	}
+	return result.Name, result.JSON, nil
+}
+
+func (h *nativeHost) Save(name string, raw json.RawMessage) error {
+	var result pluginapi.HostAuthSaveResponse
+	return h.call(pluginabi.MethodHostAuthSave, pluginapi.HostAuthSaveRequest{Name: name, JSON: raw}, &result)
+}
+
+// Log forwards a message to the host logger. Callers never pass credential material.
+func (h *nativeHost) Log(level, message string, fields map[string]any) {
+	var result json.RawMessage
+	_ = h.call(pluginabi.MethodHostLog, struct {
+		Level   string         `json:"level"`
+		Message string         `json:"message"`
+		Fields  map[string]any `json:"fields,omitempty"`
+	}{level, message, fields}, &result)
 }

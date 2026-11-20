@@ -33,7 +33,11 @@ func success(value any) []byte {
 }
 
 func failure(code string) []byte {
-	raw, _ := json.Marshal(pluginabi.Envelope{Error: &pluginabi.Error{Code: code, Message: code}})
+	return failureMessage(code, code)
+}
+
+func failureMessage(code, message string) []byte {
+	raw, _ := json.Marshal(pluginabi.Envelope{Error: &pluginabi.Error{Code: code, Message: message}})
 	return raw
 }
 
@@ -50,7 +54,8 @@ func (p *pluginRuntime) handle(method string, raw []byte) []byte {
 		}
 		cfg, err := decodeConfig(req.ConfigYAML)
 		if err != nil {
-			return failure("invalid_configuration")
+			// Validation messages name only config keys and limits, never secrets.
+			return failureMessage("invalid_configuration", err.Error())
 		}
 		if p.host == nil {
 			return failure("host_unavailable")
@@ -61,21 +66,22 @@ func (p *pluginRuntime) handle(method string, raw []byte) []byte {
 		p.stop()
 		return success(struct{}{})
 	case pluginabi.MethodSchedulerPick:
-		var req pluginapi.SchedulerPickRequest
-		if err := json.Unmarshal(raw, &req); err != nil {
-			return success(pluginapi.SchedulerPickResponse{})
+		return success(p.pick(raw))
+	case pluginabi.MethodUsageHandle:
+		var record pluginapi.UsageRecord
+		if err := json.Unmarshal(raw, &record); err == nil {
+			if e := p.active.Load(); e != nil {
+				p.observe(e, record)
+			}
 		}
-		if e := p.active.Load(); e != nil {
-			return success(e.pick(req))
-		}
-		return success(pluginapi.SchedulerPickResponse{})
+		return success(struct{}{})
 	case pluginabi.MethodManagementRegister:
 		return success(pluginapi.ManagementRegistrationResponse{
 			Routes: []pluginapi.ManagementRoute{{Method: http.MethodGet, Path: statusPath}},
 			Resources: []pluginapi.ResourceRoute{{
 				Path:        "/panel",
 				Menu:        "Cotas",
-				Description: "Limites de 5 horas e 7 dias, afinidade de sessao e a conta que reinicia primeiro.",
+				Description: "Limites de 5 horas e 7 dias, reservas por conta e prioridade pela renovacao semanal.",
 			}},
 		})
 	case pluginabi.MethodManagementHandle:
@@ -100,12 +106,46 @@ func (p *pluginRuntime) handle(method string, raw []byte) []byte {
 	}
 }
 
+// pick delegates to CPA's selector. Any decode error or panic yields an empty response, so the
+// plugin never blocks or picks an account (fail-open).
+func (p *pluginRuntime) pick(raw []byte) (response pluginapi.SchedulerPickResponse) {
+	e := p.active.Load()
+	defer func() {
+		if recover() != nil {
+			if e != nil {
+				e.failed.Store(true)
+			}
+			response = pluginapi.SchedulerPickResponse{}
+		}
+	}()
+	var req pluginapi.SchedulerPickRequest
+	if e == nil || json.Unmarshal(raw, &req) != nil {
+		return pluginapi.SchedulerPickResponse{}
+	}
+	response = e.pick(req)
+	// Enforce the contract even if the engine misbehaves: never pick, reject or handle.
+	return pluginapi.SchedulerPickResponse{ExcludeCandidates: response.ExcludeCandidates}
+}
+
+func (p *pluginRuntime) observe(e *engine, record pluginapi.UsageRecord) {
+	defer func() {
+		if recover() != nil {
+			e.failed.Store(true)
+		}
+	}()
+	e.observeUsage(record)
+}
+
 func (p *pluginRuntime) configure(cfg config) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	old := p.active.Load()
 	p.stopLocked()
 	p.fetcher = newHTTPFetcher()
 	e := newEngine(p.host, p.fetcher, cfg)
+	if old != nil {
+		e.inherit(old)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	p.cancel = cancel
 	p.done = make(chan struct{})
@@ -149,16 +189,11 @@ func registration() any {
 	}{
 		pluginabi.SchemaVersion,
 		pluginapi.Metadata{Name: pluginID, Version: pluginVersion, Author: "Shreyash (webdevcaptain)", GitHubRepository: "https://github.com/webdevcaptain/quota-reset-router", ConfigFields: []pluginapi.ConfigField{
-			{Name: "mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"shadow", "active"}, Description: "Shadow records decisions without changing routing. Active applies affinity, soonest weekly reset, and the configured caps."},
-			{Name: "poll_interval", Type: pluginapi.ConfigFieldTypeString, Description: "Quota refresh interval, 1m to 1h. Default 5m."},
-			{Name: "max_age", Type: pluginapi.ConfigFieldTypeString, Description: "Maximum quota cache age. Default 10m."},
-			{Name: "request_timeout", Type: pluginapi.ConfigFieldTypeString, Description: "Background quota request timeout, 1s to 30s. Default 10s."},
-			{Name: "five_hour_cap", Type: pluginapi.ConfigFieldTypeNumber, Default: 100, Description: "Default 5-hour utilization cap, 0 to 100. A reset window inside release_before does not lift this cap."},
-			{Name: "weekly_cap", Type: pluginapi.ConfigFieldTypeNumber, Default: 100, Description: "Default 7-day utilization cap, 0 to 100. Lifted inside each account's release window."},
-			{Name: "release_before", Type: pluginapi.ConfigFieldTypeString, Default: "5h", Description: "How long before the 7-day reset the weekly cap is lifted and the account is preferred. Default 5h."},
-			{Name: "session_ttl", Type: pluginapi.ConfigFieldTypeString, Default: "1h", Description: "Keep a session on the same eligible account. 0s disables affinity. Default 1h."},
-			{Name: "accounts", Type: pluginapi.ConfigFieldTypeObject, Description: "Per-account five_hour_cap, weekly_cap, and release_before. Omit a field to inherit the default."},
+			{Name: "mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"shadow", "active"}, Default: "shadow", Description: "Shadow only reports the plan. Active rewrites account priorities and excludes accounts at their reserve."},
+			{Name: "poll_interval", Type: pluginapi.ConfigFieldTypeString, Default: "30m", Description: "Poll the usage endpoint for accounts not observed for this long, 5m to 6h. Default 30m."},
+			{Name: "request_timeout", Type: pluginapi.ConfigFieldTypeString, Default: "10s", Description: "Usage poll timeout, 1s to 30s. Default 10s."},
+			{Name: "accounts", Type: pluginapi.ConfigFieldTypeObject, Description: "Per account (auth ID or email): five_hour_reserve and weekly_reserve, 0 to 95 percent kept unused while another account is available."},
 		}},
-		map[string]bool{"scheduler": true, "scheduler_across_priorities": true, "management_api": true},
+		map[string]bool{"scheduler": true, "scheduler_across_priorities": true, "usage_plugin": true, "management_api": true},
 	}
 }

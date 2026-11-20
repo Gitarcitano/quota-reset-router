@@ -1,8 +1,8 @@
-IMAGE := golang:1.26-bookworm@sha256:a688600ca24f8a4d3ca77f95b0dd40704a9fc787c826660eb7ba0b641b8b175d
-GO_VERSION := 1.26.8
+IMAGE := golang:1.26.10-bookworm@sha256:5de7c99eb78ca5e515a4c340235d0955ec5964a5071c492c15503d7c267da473
+GO_VERSION := 1.26.10
 # SHA-256 of https://go.dev/dl/go$(GO_VERSION).src.tar.gz, the source of the patched darwin_amd64 toolchain.
-GO_SRC_SHA256 := 4e39b98e42f946fa05ac8bc5b71877df97dbdb7cbb1a777b541667ad7117fd2e
-CPA_VERSION := 8.0.65
+GO_SRC_SHA256 := fd63e883ba2f2bfca93c1646b31ebef63e2b1e4d2b317c9789d976a68d81f36f
+CPA_VERSION := 8.0.79
 PLUGIN := quota-reset-router
 VERSION := $(shell sed -n 's/^const pluginVersion = "\(.*\)"/\1/p' config.go)
 TARGETS := linux_amd64 linux_arm64 darwin_amd64 darwin_arm64 windows_amd64
@@ -35,7 +35,7 @@ MINGW_VERSION := 10.0.0-3
 MACOS_MIN := -mmacosx-version-min=12.0
 
 docker = docker run --rm --platform linux/$(1) -v "$(CURDIR):/src" -v $(PLUGIN)-go-mod:/go/pkg/mod -v $(PLUGIN)-go-build-$(1):/root/.cache/go-build -w /src
-ISOLATED := --network none --add-host api.anthropic.com:127.0.0.1 --add-host chatgpt.com:127.0.0.1 -e PLUGIN_ISOLATED_TEST=1
+ISOLATED := --network none --add-host api.anthropic.com:127.0.0.1 -e PLUGIN_ISOLATED_TEST=1
 LINUX_ONLY = $(if $(filter linux,$(TARGET_OS)),,$(error $@ loads the plugin in a Linux container; set TARGET to linux_amd64 or linux_arm64))
 
 ifeq ($(filter $(TARGET),$(TARGETS)),)

@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -10,32 +11,28 @@ import (
 )
 
 const pluginID = "quota-reset-router"
-const pluginVersion = "0.3.0"
+const pluginVersion = "0.4.0"
 
-type accountLimit struct {
-	FiveHourCap   *float64 `yaml:"five_hour_cap" json:"five_hour_cap,omitempty"`
-	WeeklyCap     *float64 `yaml:"weekly_cap" json:"weekly_cap,omitempty"`
-	ReleaseBefore string   `yaml:"release_before" json:"release_before,omitempty"`
+const maxReserve = 95
+
+// accountReserve keeps part of a window unused. A value R means the account stops
+// taking traffic at 100-R percent utilization while another account is available.
+type accountReserve struct {
+	FiveHourReserve *float64 `yaml:"five_hour_reserve" json:"five_hour_reserve,omitempty"`
+	WeeklyReserve   *float64 `yaml:"weekly_reserve" json:"weekly_reserve,omitempty"`
 }
 
 type config struct {
-	Mode           string                  `yaml:"mode" json:"mode"`
-	PollInterval   time.Duration           `yaml:"poll_interval" json:"-"`
-	MaxAge         time.Duration           `yaml:"max_age" json:"-"`
-	RequestTimeout time.Duration           `yaml:"request_timeout" json:"-"`
-	FiveHourCap    float64                 `yaml:"five_hour_cap" json:"five_hour_cap"`
-	WeeklyCap      float64                 `yaml:"weekly_cap" json:"weekly_cap"`
-	ReleaseBefore  time.Duration           `yaml:"release_before" json:"-"`
-	SessionTTL     time.Duration           `yaml:"session_ttl" json:"-"`
-	Accounts       map[string]accountLimit `yaml:"accounts" json:"accounts,omitempty"`
+	Mode           string                    `yaml:"mode" json:"mode"`
+	PollInterval   time.Duration             `yaml:"poll_interval" json:"-"`
+	RequestTimeout time.Duration             `yaml:"request_timeout" json:"-"`
+	Accounts       map[string]accountReserve `yaml:"accounts" json:"accounts,omitempty"`
 }
 
 func decodeConfig(raw []byte) (config, error) {
-	cfg := config{
-		Mode: "shadow", PollInterval: 5 * time.Minute, MaxAge: 10 * time.Minute, RequestTimeout: 10 * time.Second,
-		FiveHourCap: 100, WeeklyCap: 100, ReleaseBefore: 5 * time.Hour, SessionTTL: time.Hour,
-	}
+	cfg := config{Mode: "shadow", PollInterval: 30 * time.Minute, RequestTimeout: 10 * time.Second}
 	if len(raw) != 0 {
+		// Unknown keys (including the removed caps and session settings) are ignored.
 		if err := yaml.Unmarshal(raw, &cfg); err != nil {
 			return config{}, errors.New("invalid plugin configuration")
 		}
@@ -43,78 +40,47 @@ func decodeConfig(raw []byte) (config, error) {
 	if cfg.Mode != "shadow" && cfg.Mode != "active" {
 		return config{}, errors.New("mode must be shadow or active")
 	}
-	if cfg.PollInterval < time.Minute || cfg.PollInterval > time.Hour {
-		return config{}, errors.New("poll_interval must be between 1m and 1h")
-	}
-	if cfg.MaxAge < cfg.PollInterval || cfg.MaxAge > time.Hour {
-		return config{}, errors.New("max_age must be between poll_interval and 1h")
+	if cfg.PollInterval < 5*time.Minute || cfg.PollInterval > 6*time.Hour {
+		return config{}, errors.New("poll_interval must be between 5m and 6h")
 	}
 	if cfg.RequestTimeout < time.Second || cfg.RequestTimeout > 30*time.Second {
 		return config{}, errors.New("request_timeout must be between 1s and 30s")
 	}
-	if err := validPercent("five_hour_cap", cfg.FiveHourCap); err != nil {
-		return config{}, err
-	}
-	if err := validPercent("weekly_cap", cfg.WeeklyCap); err != nil {
-		return config{}, err
-	}
-	if cfg.ReleaseBefore < 0 || cfg.ReleaseBefore > 48*time.Hour {
-		return config{}, errors.New("release_before must be between 0s and 48h")
-	}
-	if cfg.SessionTTL < 0 || cfg.SessionTTL > 24*time.Hour {
-		return config{}, errors.New("session_ttl must be between 0s and 24h")
-	}
-	for id, limit := range cfg.Accounts {
-		if strings.TrimSpace(id) == "" {
+	seen := make(map[string]bool, len(cfg.Accounts))
+	for id, reserve := range cfg.Accounts {
+		key := accountKey(id)
+		if key == "" {
 			return config{}, errors.New("account id is empty")
 		}
-		if limit.FiveHourCap != nil {
-			if err := validPercent("five_hour_cap", *limit.FiveHourCap); err != nil {
-				return config{}, err
-			}
+		if seen[key] {
+			return config{}, fmt.Errorf("account %s is configured more than once", key)
 		}
-		if limit.WeeklyCap != nil {
-			if err := validPercent("weekly_cap", *limit.WeeklyCap); err != nil {
-				return config{}, err
-			}
-		}
-		if strings.TrimSpace(limit.ReleaseBefore) != "" {
-			window, err := time.ParseDuration(strings.TrimSpace(limit.ReleaseBefore))
-			if err != nil || window < 0 || window > 48*time.Hour {
-				return config{}, fmt.Errorf("release_before for %s must be between 0s and 48h", id)
+		seen[key] = true
+		for name, value := range map[string]*float64{"five_hour_reserve": reserve.FiveHourReserve, "weekly_reserve": reserve.WeeklyReserve} {
+			if value != nil && (math.IsNaN(*value) || *value < 0 || *value > maxReserve) {
+				return config{}, fmt.Errorf("%s for %s must be between 0 and %d", name, key, maxReserve)
 			}
 		}
 	}
 	return cfg, nil
 }
 
-func validPercent(name string, value float64) error {
-	if value < 0 || value > 100 {
-		return fmt.Errorf("%s must be between 0 and 100", name)
-	}
-	return nil
+func accountKey(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
 }
 
-func (c config) fiveHourCap(id string) float64 {
-	if limit, ok := c.Accounts[id]; ok && limit.FiveHourCap != nil {
-		return *limit.FiveHourCap
-	}
-	return c.FiveHourCap
-}
-
-func (c config) weeklyCap(id string) float64 {
-	if limit, ok := c.Accounts[id]; ok && limit.WeeklyCap != nil {
-		return *limit.WeeklyCap
-	}
-	return c.WeeklyCap
-}
-
-func (c config) releaseBefore(id string) time.Duration {
-	if limit, ok := c.Accounts[id]; ok && strings.TrimSpace(limit.ReleaseBefore) != "" {
-		window, err := time.ParseDuration(strings.TrimSpace(limit.ReleaseBefore))
-		if err == nil {
-			return window
+// reserveFor returns the reserve configured for an account, keyed by auth ID first and
+// then by email, both compared case-insensitively.
+func (c config) reserveFor(id, email string) accountReserve {
+	for _, want := range []string{accountKey(id), accountKey(email)} {
+		if want == "" {
+			continue
+		}
+		for key, reserve := range c.Accounts {
+			if accountKey(key) == want {
+				return reserve
+			}
 		}
 	}
-	return c.ReleaseBefore
+	return accountReserve{}
 }

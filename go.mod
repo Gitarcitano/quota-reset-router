@@ -3,6 +3,8 @@ module github.com/webdevcaptain/quota-reset-router
 go 1.26.10
 
 require (
-	github.com/router-for-me/CLIProxyAPI/v8 v8.0.65
+	github.com/router-for-me/CLIProxyAPI/v8 v8.0.79
 	gopkg.in/yaml.v3 v3.0.1
 )
+
+require github.com/MoeForge/moego v0.1.0-alpha.4 // indirect
