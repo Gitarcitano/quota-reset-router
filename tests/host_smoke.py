@@ -242,8 +242,14 @@ plugins:
                 },
                 method=method,
             )
-            with opener.open(request, timeout=15) as response:
-                return response.read()
+            try:
+                with opener.open(request, timeout=15) as response:
+                    return response.read()
+            except urllib.error.HTTPError as exc:
+                # Still a URLError, so wait_for keeps retrying, but with the body.
+                raise urllib.error.URLError(
+                    f"{method} {path}: HTTP {exc.code}: {exc.read()[:500]!r}"
+                ) from None
 
         # The plugin reconciles every 30 s, so waits for writes allow a full cycle.
         def wait_for(check, label, timeout=45):
@@ -280,17 +286,31 @@ plugins:
             api(AUTH_STATUS, "PATCH", {"name": account + ".json", "disabled": disabled})
 
         def message(session):
-            raw = api(
-                "/v1/messages",
-                "POST",
-                {
-                    "model": MODEL,
-                    "max_tokens": 16,
-                    "messages": [{"role": "user", "content": "Synthetic routing test"}],
-                },
-                False,
-                {"X-Claude-Code-Session-Id": session},
-            )
+            # CPA rebuilds its model registry after startup and after an auth status
+            # change; until then it answers "unknown provider", which never reaches the
+            # scheduler, so only that error is retried.
+            def send():
+                try:
+                    return api(
+                        "/v1/messages",
+                        "POST",
+                        {
+                            "model": MODEL,
+                            "max_tokens": 16,
+                            "messages": [
+                                {"role": "user", "content": "Synthetic routing test"}
+                            ],
+                        },
+                        False,
+                        {"X-Claude-Code-Session-Id": session},
+                    )
+                except urllib.error.URLError as exc:
+                    if "unknown provider" in str(exc.reason):
+                        return None
+                    # Any other failure is real: escape wait_for instead of retrying.
+                    raise AssertionError(str(exc.reason)) from None
+
+            raw = wait_for(send, "model " + MODEL + " registered", timeout=15)
             return json.loads(raw)["content"][0]["text"]
 
         def registered():
