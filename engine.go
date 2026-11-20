@@ -177,11 +177,14 @@ func (e *engine) syncRoster() bool {
 		}
 		seen[entry.ID] = true
 		acc := e.accounts[entry.ID]
-		if acc == nil || acc.Index != entry.AuthIndex {
+		email := strings.TrimSpace(entry.Email)
+		// A new auth index or a different account behind the same ID is a new credential:
+		// the previous account's windows, timestamps and backoff do not apply to it.
+		if acc == nil || acc.Index != entry.AuthIndex || (acc.Email != "" && !strings.EqualFold(acc.Email, email)) {
 			acc = &account{ID: entry.ID, Index: entry.AuthIndex}
 			e.accounts[entry.ID] = acc
 		}
-		acc.Email = strings.TrimSpace(entry.Email)
+		acc.Email = email
 		acc.Label = accountLabel(entry)
 		acc.Priority = entry.Priority
 		acc.LastRefresh = entry.LastRefresh
@@ -464,7 +467,9 @@ func (e *engine) applyPriorities() {
 			}
 		}
 		e.mu.Unlock()
-		if result != "ok" && !strings.HasPrefix(result, "deferred") && !strings.HasPrefix(result, "skipped") {
+		// Only a failed save or encode stops the pass. A credential that cannot be read or
+		// parsed is a problem of that file alone, so the accounts below it are still written.
+		if result == "save_failed" || result == "encode_failed" {
 			return
 		}
 	}

@@ -612,6 +612,18 @@ func TestRosterFiltersAndResetsOnIndexChange(t *testing.T) {
 	if e.accounts["a"].FiveHour.Utilization != nil {
 		t.Fatal("observations survived a credential swap")
 	}
+	// Another account behind the same ID and auth index is a swap too; a case change is not.
+	setWindows(e, "b", win(50, time.Hour), win(20, 48*time.Hour))
+	host.entries[1].Email = "B@Example.com"
+	e.syncRoster()
+	if e.accounts["b"].FiveHour.Utilization == nil {
+		t.Fatal("an email case change dropped observations")
+	}
+	host.entries[1].Email = "other@example.com"
+	e.syncRoster()
+	if e.accounts["b"].FiveHour.Utilization != nil || e.accounts["b"].Weekly.ResetsAt != nil || e.accounts["b"].Email != "other@example.com" {
+		t.Fatalf("observations survived an account change: %+v", e.accounts["b"])
+	}
 }
 
 func TestReconfigureKeepsObservations(t *testing.T) {
@@ -763,6 +775,24 @@ func TestPriorityWriteNeverRacesTokenRefresh(t *testing.T) {
 			t.Fatal("refreshed credential was overwritten")
 		}
 	})
+}
+
+func TestUnreadableCredentialSkipsOnlyItself(t *testing.T) {
+	for name, broken := range map[string]func(h *fakeHost){
+		"invalid_json": func(h *fakeHost) { h.files["idx-a"] = "not json" },
+		"read_failed":  func(h *fakeHost) { h.getErr = map[string]error{"idx-a": errors.New("gone")} },
+	} {
+		e, host, _, _ := testEngine(t)
+		e.syncRoster()
+		setWindows(e, "a", window{}, win(10, 24*time.Hour))
+		setWindows(e, "b", window{}, win(10, 48*time.Hour))
+		setWindows(e, "c", window{}, win(10, 72*time.Hour))
+		broken(host)
+		e.applyPriorities()
+		if e.accounts["a"].LastWrite != name || e.accounts["b"].LastWrite != "ok" || e.accounts["c"].LastWrite != "ok" {
+			t.Fatalf("%s: got a=%q b=%q c=%q", name, e.accounts["a"].LastWrite, e.accounts["b"].LastWrite, e.accounts["c"].LastWrite)
+		}
+	}
 }
 
 func TestHardWriteFailureStopsThePass(t *testing.T) {

@@ -63,11 +63,15 @@ function age(seconds) {
   return Math.round(seconds / 3600) + "h";
 }
 // The config key for a row: an existing ID or email key, otherwise the email, otherwise the ID.
+// Keys compare like the backend does: trimmed and case-insensitive, the ID first.
 function configKey(id, account) {
-  if (configured[id]) return id;
-  const email = (account.email || "").toLowerCase();
-  const match = Object.keys(configured).find((key) => email && key.toLowerCase() === email);
-  return match || account.email || id;
+  const norm = (value) => (value || "").trim().toLowerCase();
+  const keys = Object.keys(configured);
+  const byId = keys.find((key) => norm(key) === norm(id));
+  if (byId) return byId;
+  const email = norm(account.email);
+  const byEmail = email && keys.find((key) => norm(key) === email);
+  return byEmail || account.email || id;
 }
 async function load() {
   try { sessionStorage.setItem("quota-reset-router-key", keyEl.value.trim()); } catch (error) {}

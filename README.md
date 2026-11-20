@@ -42,7 +42,7 @@ Example: with `five_hour_reserve: 10`, the account stops taking new sessions at 
 - Writes run only in the background loop (every 30 seconds), never on the request path. A new observation can take up to 30 seconds to show in the priorities.
 - Each write re-reads the credential file with `host.auth.get`, changes only the top-level `priority` key, and saves it under the same name with `host.auth.save`. If the read fails or the file is not valid JSON, the account is skipped.
 - `host.auth.save` replaces the whole file, so a write must never race CLIProxyAPI's token refresh. A write is deferred while the token expires in less than 4h10m (CLIProxyAPI refreshes Claude tokens 4h before expiry), within 2 minutes of a refresh, or when the file changed between the read and a second read right before the save. Deferred writes are retried on the next pass.
-- Accounts are written in rank order, top first. A failed write stops the pass, so a half-applied order is not left behind; the next pass retries.
+- Accounts are written in rank order, top first. A failed save stops the pass, so a half-applied order is not left behind; the next pass retries. A credential that cannot be read or parsed only skips that account (`last_write: read_failed` or `invalid_json`).
 - The log line names the account by email or ID with the old and new priority. Tokens are never logged.
 
 ### Fail-open
