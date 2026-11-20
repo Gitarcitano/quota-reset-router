@@ -62,7 +62,7 @@ Start in `shadow`, check the planned priorities on the panel, then switch to `ac
 - Linux amd64 or arm64 (glibc 2.34 or newer), macOS 12 or newer on Apple silicon or Intel, or Windows amd64.
 - The Intel macOS build uses a patched Go toolchain. See [Intel Macs](#intel-macs).
 - Recommended routing: `strategy: fill-first` and `session-affinity: true`. Other strategies still honor the priorities and exclusions, but only fill-first sends all new sessions to the top account.
-- Polling needs direct network access to `api.anthropic.com`. Credentials with `proxy_url` or `base_url` are not polled (they can still be observed from headers), and polling ignores CLIProxyAPI's `proxy-url` and proxy environment variables.
+- Polling needs direct network access to `api.anthropic.com`. Credentials with `proxy_url` are not polled (they can still be observed from headers). Credentials with `base_url` are not tracked at all: no reserve, no header observation and no priority writes, and polling ignores CLIProxyAPI's `proxy-url` and proxy environment variables.
 
 ## Install
 
