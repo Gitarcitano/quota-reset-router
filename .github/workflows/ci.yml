@@ -58,21 +58,21 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: 1.26.8
+          go-version: 1.26.10
           cache: false
       - run: make test build zip load-test
-      # macOS stand-in for the Linux test container: pin the quota hosts to the local fixture and trust its certificate.
+      # macOS stand-in for the Linux test container: pin the quota host to the local fixture and trust its certificate.
       - name: Set up host-test fixtures
         run: |
           set -eu
           openssl req -x509 -newkey rsa:2048 -nodes -days 1 -sha256 \
             -keyout "$RUNNER_TEMP/fixture-key.pem" -out "$RUNNER_TEMP/fixture-cert.pem" \
             -subj /CN=api.anthropic.com \
-            -addext subjectAltName=DNS:api.anthropic.com,DNS:chatgpt.com \
+            -addext subjectAltName=DNS:api.anthropic.com \
             -addext extendedKeyUsage=serverAuth
           sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$RUNNER_TEMP/fixture-cert.pem"
           security verify-cert -c "$RUNNER_TEMP/fixture-cert.pem" -p ssl -s api.anthropic.com
-          echo "127.0.0.1 api.anthropic.com chatgpt.com" | sudo tee -a /etc/hosts
+          echo "127.0.0.1 api.anthropic.com" | sudo tee -a /etc/hosts
           sudo dscacheutil -flushcache
           sudo killall -HUP mDNSResponder
       - run: make host-test

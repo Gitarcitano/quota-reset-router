@@ -50,51 +50,15 @@ func TestParseQuota(t *testing.T) {
 	}
 }
 
-func TestParseCodexQuotaWindows(t *testing.T) {
-	raw := []byte(`{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":60,"limit_window_seconds":18000,"reset_at":1790172000,"reset_after_seconds":7200},"secondary_window":{"used_percent":30,"limit_window_seconds":604800,"reset_at":1790683200,"reset_after_seconds":518400}}}`)
-	snapshot, err := parseCodexQuota(raw, testNow)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if snapshot.PlanType != "plus" || snapshot.FiveHour == nil || snapshot.Weekly.ResetsAt == nil {
-		t.Fatalf("missing codex windows: %+v", snapshot)
-	}
-	if *snapshot.FiveHour.Utilization != 60 || *snapshot.Weekly.Utilization != 30 {
-		t.Fatalf("wrong codex utilization: %+v", snapshot)
-	}
-	if snapshot.FiveHour.ResetsAt.Before(testNow) || snapshot.Weekly.ResetsAt.Before(testNow) {
-		t.Fatalf("wrong codex reset timestamps: %+v", snapshot)
-	}
-	weeklyOnly, err := parseCodexQuota([]byte(`{"rate_limit":{"primary_window":{"used_percent":40,"limit_window_seconds":604800,"reset_after_seconds":360000}}}`), testNow)
-	if err != nil || weeklyOnly.FiveHour != nil || weeklyOnly.Weekly.ResetsAt == nil {
-		t.Fatalf("weekly-only Codex plan was not parsed: %+v, %v", weeklyOnly, err)
-	}
-}
-
-func TestParseCodexRejectsAmbiguousOrInvalidWindows(t *testing.T) {
-	for _, raw := range []string{
-		`{"rate_limit":{}}`,
-		`{"rate_limit":{"primary_window":{"used_percent":101,"limit_window_seconds":18000,"reset_at":1}}}`,
-		`{"rate_limit":{"primary_window":{"used_percent":10,"limit_window_seconds":123,"reset_at":1}}}`,
-		`{"rate_limit":{"primary_window":{"used_percent":10,"limit_window_seconds":18000}}}`,
-		`{"rate_limit":{"secondary_window":{"used_percent":10,"limit_window_seconds":604800}}}`,
-		`{"rate_limit":{"primary_window":{"used_percent":10,"limit_window_seconds":18000,"reset_at":"bad"},"secondary_window":{"used_percent":10,"limit_window_seconds":604800,"reset_at":1}}}`,
-	} {
-		if _, err := parseCodexQuota([]byte(raw), testNow); err == nil {
-			t.Fatalf("accepted invalid Codex payload: %s", raw)
-		}
-	}
-}
-
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
 func testCredential() credential {
-	return credential{Type: "claude", AccessToken: "SECRET_TOKEN", AccountUUID: "a"}
+	return credential{Type: "claude", AccessToken: "SECRET_TOKEN"}
 }
 
-func TestHTTPQuotaRequestAndIdentity(t *testing.T) {
+func TestHTTPQuotaRequest(t *testing.T) {
 	f := newHTTPFetcher()
 	f.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if r.URL.String() != claudeUsageURL || r.Method != http.MethodGet || r.Body != nil {
@@ -109,28 +73,12 @@ func TestHTTPQuotaRequestAndIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snap.Identity != testCredential().identity() || snap.ReadAt.IsZero() {
-		t.Fatal("missing identity or freshness")
+	if snap.ReadAt.IsZero() || snap.Provider != "claude" {
+		t.Fatal("missing freshness or provider")
 	}
 	encoded, _ := json.Marshal(snap)
-	if strings.Contains(string(encoded), "SECRET_TOKEN") || strings.Contains(string(encoded), snap.Identity) {
-		t.Fatal("identity leaked")
-	}
-}
-
-func TestHTTPCodeQuotaRequestAndIdentity(t *testing.T) {
-	f := newHTTPFetcher()
-	f.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		if r.URL.String() != codexUsageURL || r.Method != http.MethodGet || r.Header.Get("Authorization") != "Bearer CODEX_TOKEN" || r.Header.Get("Chatgpt-Account-Id") != "account-id" || r.Header.Get("User-Agent") == "" {
-			t.Fatalf("unexpected Codex request: %s %+v", r.URL, r.Header)
-		}
-		body := `{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":45,"limit_window_seconds":18000,"reset_after_seconds":3600},"secondary_window":{"used_percent":10,"limit_window_seconds":604800,"reset_after_seconds":3600}}}`
-		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body))}, nil
-	})
-	cred := credential{Type: "codex", AccessToken: "CODEX_TOKEN", AccountID: "account-id"}
-	snapshot, err := f.Fetch(context.Background(), cred)
-	if err != nil || snapshot.Provider != "codex" || snapshot.Identity != cred.identity() {
-		t.Fatalf("bad Codex fetch: %+v, %v", snapshot, err)
+	if strings.Contains(string(encoded), "SECRET_TOKEN") {
+		t.Fatal("token leaked")
 	}
 }
 
@@ -185,6 +133,7 @@ func TestCredentialEligibilityAndCancellation(t *testing.T) {
 	for _, change := range []func(*credential){
 		func(c *credential) { c.Disabled = true },
 		func(c *credential) { c.Type = "unsupported" },
+		func(c *credential) { c.Type = "codex" },
 		func(c *credential) { c.AccessToken = "" },
 		func(c *credential) { c.ProxyURL = "http://proxy.test" },
 		func(c *credential) { c.BaseURL = "https://custom.test" },
@@ -217,7 +166,8 @@ func TestRetryAfter(t *testing.T) {
 		raw  string
 		want time.Duration
 	}{
-		{"120", 2 * time.Minute}, {"-5", 0}, {"9999999999", time.Hour}, {"not a date", 0},
+		{"120", 2 * time.Minute}, {"7200", 2 * time.Hour}, {"-5", 0}, {"9999999999", 6 * time.Hour}, {"not a date", 0},
+		{testNow.Add(3 * time.Hour).Format(http.TimeFormat), 3 * time.Hour},
 		{testNow.Add(3 * time.Minute).Format(http.TimeFormat), 3 * time.Minute},
 		{testNow.Add(-time.Minute).Format(http.TimeFormat), 0},
 	} {

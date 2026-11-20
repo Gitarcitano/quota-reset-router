@@ -8,24 +8,54 @@ import (
 	"testing"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
 func TestConfigValidation(t *testing.T) {
-	for _, raw := range []string{"", "mode: active", "enabled: true\npriority: 10\nmode: shadow", "poll_interval: 1m\nmax_age: 2m\nrequest_timeout: 1s"} {
+	valid := []string{
+		"",
+		"mode: active",
+		"poll_interval: 5m\nrequest_timeout: 1s",
+		"poll_interval: 6h",
+		"accounts:\n  User@Example.com:\n    five_hour_reserve: 10\n    weekly_reserve: 15",
+		"accounts:\n  a:\n    weekly_reserve: 0\n  b:\n    five_hour_reserve: 95",
+		// Keys from 0.3.x and unknown keys do not break loading.
+		"enabled: true\npriority: 10\nmode: shadow\nmax_age: 10m\nfive_hour_cap: 80\nweekly_cap: 90\nrelease_before: 5h\nsession_ttl: 1h\nfuture_key: x",
+		"accounts:\n  a:\n    weekly_cap: 50\n    five_hour_reserve: 10",
+	}
+	for _, raw := range valid {
 		if _, err := decodeConfig([]byte(raw)); err != nil {
 			t.Fatalf("valid config %q: %v", raw, err)
 		}
 	}
-	for _, raw := range []string{"mode: wrong", "poll_interval: 1s", "poll_interval: 2h", "max_age: 1m", "max_age: 2h", "request_timeout: 0s", "request_timeout: 31s", "poll_interval: invalid"} {
+	invalid := []string{
+		"mode: wrong", "poll_interval: 4m", "poll_interval: 7h", "poll_interval: invalid",
+		"request_timeout: 0s", "request_timeout: 31s",
+		"accounts:\n  a:\n    five_hour_reserve: 96", "accounts:\n  a:\n    weekly_reserve: -1",
+		"accounts:\n  a:\n    weekly_reserve: lots", "accounts:\n  \"\":\n    weekly_reserve: 10",
+	}
+	for _, raw := range invalid {
 		if _, err := decodeConfig([]byte(raw)); err == nil {
 			t.Fatalf("invalid config accepted: %q", raw)
 		}
 	}
 	cfg, _ := decodeConfig(nil)
-	if cfg.Mode != "shadow" {
-		t.Fatal("default must not alter routing")
+	if cfg.Mode != "shadow" || cfg.PollInterval != 30*time.Minute || cfg.RequestTimeout != 10*time.Second {
+		t.Fatalf("bad defaults: %+v", cfg)
+	}
+	cfg, _ = decodeConfig([]byte("accounts:\n  User@Example.com:\n    five_hour_reserve: 10\n    weekly_reserve: 15\n  id-1:\n    weekly_reserve: 5"))
+	if r := cfg.reserveFor("other", "user@example.COM"); r.FiveHourReserve == nil || *r.FiveHourReserve != 10 || *r.WeeklyReserve != 15 {
+		t.Fatalf("email lookup failed: %+v", r)
+	}
+	if r := cfg.reserveFor("id-1", "user@example.com"); r.FiveHourReserve != nil || *r.WeeklyReserve != 5 {
+		t.Fatal("auth ID key must win over the email key")
+	}
+	if r := cfg.reserveFor("ID-1", ""); r.WeeklyReserve == nil || *r.WeeklyReserve != 5 {
+		t.Fatal("auth ID key must match case-insensitively")
+	}
+	if r := cfg.reserveFor("nobody", ""); r.FiveHourReserve != nil || r.WeeklyReserve != nil {
+		t.Fatal("unconfigured account has a reserve")
 	}
 }
 
@@ -53,7 +83,7 @@ func TestRuntimeRegistrationReconfigureShutdown(t *testing.T) {
 	if env := decodeEnvelope(t, p.handle(pluginabi.MethodPluginRegister, []byte(`{}`)), &reg); !env.OK {
 		t.Fatalf("register: %s", env.Error)
 	}
-	if reg.SchemaVersion != 6 || !reg.Capabilities["scheduler"] || !reg.Capabilities["management_api"] || len(reg.Capabilities) != 2 {
+	if reg.SchemaVersion != pluginabi.SchemaVersion || !reg.Capabilities["scheduler"] || !reg.Capabilities["scheduler_across_priorities"] || !reg.Capabilities["management_api"] || !reg.Capabilities["usage_plugin"] || len(reg.Capabilities) != 4 {
 		t.Fatalf("unexpected capabilities: %+v", reg)
 	}
 	if p.active.Load().cfg.Mode != "shadow" {
@@ -83,6 +113,31 @@ func TestRuntimeRegistrationReconfigureShutdown(t *testing.T) {
 	if pick.Handled {
 		t.Fatal("stopped runtime handled pick")
 	}
+	if env := decodeEnvelope(t, p.handle(pluginabi.MethodUsageHandle, []byte(`{}`)), nil); !env.OK {
+		t.Fatal("usage.handle must succeed without an active worker")
+	}
+}
+
+func TestRuntimeUsageHandleUpdatesState(t *testing.T) {
+	p := &pluginRuntime{}
+	e, host, _, _ := testEngine(t)
+	e.syncRoster()
+	p.active.Store(e)
+	calls := host.callCount()
+	record, _ := json.Marshal(pluginapi.UsageRecord{AuthID: "a", Provider: "claude", ResponseHeaders: map[string][]string{"Anthropic-Ratelimit-Unified-7d-Utilization": {"0.5"}}})
+	var result map[string]any
+	if env := decodeEnvelope(t, p.handle(pluginabi.MethodUsageHandle, record), &result); !env.OK || len(result) != 0 {
+		t.Fatalf("usage.handle response: %+v %v", env, result)
+	}
+	if e.accounts["a"].Weekly.Utilization == nil || *e.accounts["a"].Weekly.Utilization != 50 || e.accounts["a"].Source != "headers" {
+		t.Fatalf("usage not recorded: %+v", e.accounts["a"])
+	}
+	if host.callCount() != calls {
+		t.Fatal("usage.handle called the host")
+	}
+	if env := decodeEnvelope(t, p.handle(pluginabi.MethodUsageHandle, []byte(`broken`)), nil); !env.OK {
+		t.Fatal("malformed usage must not fail")
+	}
 }
 
 func TestRuntimeManagementIsReadOnlyAndSanitized(t *testing.T) {
@@ -97,6 +152,11 @@ func TestRuntimeManagementIsReadOnlyAndSanitized(t *testing.T) {
 	}
 	if strings.Contains(string(response.Body), "SECRET_TOKEN") {
 		t.Fatal("secret leaked")
+	}
+	request, _ = json.Marshal(pluginapi.ManagementRequest{Method: "GET", Path: panelPath})
+	decodeEnvelope(t, p.handle(pluginabi.MethodManagementHandle, request), &response)
+	if response.StatusCode != 200 || !strings.Contains(string(response.Body), "Cotas") {
+		t.Fatal("panel was not served")
 	}
 	for _, method := range []string{"POST", "PATCH", "DELETE"} {
 		request, _ = json.Marshal(pluginapi.ManagementRequest{Method: method, Path: statusPath})

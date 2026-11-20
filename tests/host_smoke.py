@@ -1,6 +1,18 @@
-"""Run the official CPA release binary against synthetic credentials and local TLS."""
+"""Run the official CPA release binary against synthetic credentials and local TLS.
+
+CPA runs with fill-first and session affinity. The quota endpoint is down, so the
+plugin learns only from the rate-limit headers on fixture responses. Checks:
+a. the plugin registers;
+b. priorities are rewritten so the earliest weekly reset is on top, and the auth
+   files keep every other field;
+c. a session bound to the other account stays there, while a new session goes to
+   the new top account;
+d. an account past its reserve gets no new sessions while another account is
+   available, and gets traffic again when it is the only one.
+"""
 
 from concurrent.futures import ThreadPoolExecutor
+import itertools
 import datetime as dt
 import hashlib
 import http.server
@@ -20,6 +32,8 @@ import urllib.request
 
 
 PLUGIN = "quota-reset-router"
+PLUGINS = "/v8/management/plugins"
+AUTH_STATUS = "/v0/management/auth-files/status"
 STATUS = "/v0/management/plugins/" + PLUGIN + "/status"
 CONFIG = "/v0/management/plugins/" + PLUGIN + "/config"
 MODEL = "claude-opus-4-6"
@@ -27,8 +41,8 @@ MODEL = "claude-opus-4-6"
 
 def main():
     assert os.environ.get("PLUGIN_ISOLATED_TEST") == "1", (
-        "Requires api.anthropic.com and chatgpt.com pinned to 127.0.0.1, as in the "
-        "Linux test container or macOS CI"
+        "Requires api.anthropic.com pinned to 127.0.0.1, as in the Linux test "
+        "container or macOS CI"
     )
     if len(sys.argv) != 4:
         sys.exit(
@@ -40,97 +54,56 @@ def main():
         line.split()[::-1] for line in checksums_path.read_text().splitlines()
     )
     assert hashlib.sha256(archive.read_bytes()).hexdigest() == checksums[archive.name]
-    claude_ids = ["a-seven-days", "b-two-days", "c-one-day", "z-five-hours"]
-    codex_ids = ["codex-later", "codex-sooner"]
-    ids = claude_ids + codex_ids
-    durations = dict(zip(claude_ids, [168, 48, 24, 5]))
-    durations.update({"codex-later": 48, "codex-sooner": 5})
-    exhausted, reject_messages = set(), set()
-    quota_failure = False
+    ids = ["alpha", "beta"]
+    start = int(time.time())
+    # Per account and window: (utilization fraction, reset as unix seconds).
+    # beta's weekly window resets first, so beta must end on top.
+    limits = {
+        "alpha": {"5h": (0.1, start + 3 * 3600), "7d": (0.2, start + 120 * 3600)},
+        "beta": {"5h": (0.1, start + 3 * 3600), "7d": (0.3, start + 48 * 3600)},
+    }
     fixture_errors = []
-    messages = []
-
-    def deadline(hours):
-        return (
-            dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=hours)
-        ).isoformat()
+    usage_polls = []
 
     class Fixture(http.server.BaseHTTPRequestHandler):
         def account(self):
-            auth = self.headers.get("Authorization", "")
-            token = auth.removeprefix("Bearer sk-ant-oat-test-").removeprefix(
-                "Bearer codex-token-"
+            token = self.headers.get("Authorization", "").removeprefix(
+                "Bearer sk-ant-oat-test-"
             )
             if token not in ids:
                 fixture_errors.append("unknown synthetic account")
             return token
 
-        def send_json(self, code, body):
+        def send_json(self, code, body, extra=None):
             raw = json.dumps(body).encode()
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(raw)))
+            for name, value in (extra or {}).items():
+                self.send_header(name, value)
             self.end_headers()
             self.wfile.write(raw)
 
         def do_GET(self):
-            if self.path not in ("/api/oauth/usage", "/backend-api/wham/usage"):
+            if self.path != "/api/oauth/usage":
                 fixture_errors.append("unexpected GET " + self.path)
                 return self.send_json(404, {})
-            account = self.account()
-            if quota_failure:
-                return self.send_json(503, {"error": "synthetic quota outage"})
-            if self.path == "/api/oauth/usage":
-                body = {
-                    "seven_day": {
-                        "utilization": 20,
-                        "resets_at": deadline(durations[account]),
-                    },
-                    "five_hour": {
-                        "utilization": 100 if account in exhausted else 0,
-                        "resets_at": deadline(2)
-                        if account in exhausted
-                        else deadline(1)
-                        if account == claude_ids[0]
-                        else None,
-                    },
-                }
-            else:
-                body = {
-                    "plan_type": "plus",
-                    "rate_limit": {
-                        "primary_window": {
-                            "used_percent": 20,
-                            "limit_window_seconds": 18000,
-                            "reset_after_seconds": 7200,
-                        },
-                        "secondary_window": {
-                            "used_percent": 20,
-                            "limit_window_seconds": 604800,
-                            "reset_after_seconds": durations[account] * 3600,
-                        },
-                    },
-                }
-            self.send_json(200, body)
+            usage_polls.append(self.account())
+            # The quota endpoint is down: headers are the only quota source.
+            self.send_json(503, {"error": "synthetic quota outage"})
 
         def do_POST(self):
             if self.path.split("?")[0] != "/v1/messages":
                 fixture_errors.append("unexpected POST " + self.path)
                 return self.send_json(404, {})
             account = self.account()
-            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            messages.append(account)
-            if account in reject_messages:
-                return self.send_json(
-                    429,
-                    {
-                        "type": "error",
-                        "error": {
-                            "type": "rate_limit_error",
-                            "message": "synthetic account exhausted",
-                        },
-                    },
-                )
+            self.rfile.read(int(self.headers["Content-Length"]))
+            headers = {}
+            for name, (utilization, reset) in limits[account].items():
+                prefix = "anthropic-ratelimit-unified-" + name + "-"
+                headers[prefix + "utilization"] = str(utilization)
+                headers[prefix + "reset"] = str(reset)
+                headers[prefix + "status"] = "allowed"
             message = {
                 "id": "msg_synthetic",
                 "type": "message",
@@ -141,48 +114,7 @@ def main():
                 "stop_sequence": None,
                 "usage": {"input_tokens": 1, "output_tokens": 1},
             }
-            if not body.get("stream"):
-                return self.send_json(200, message)
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.end_headers()
-            start = dict(message, content=[], stop_reason=None)
-            events = [
-                ("message_start", {"type": "message_start", "message": start}),
-                (
-                    "content_block_start",
-                    {
-                        "type": "content_block_start",
-                        "index": 0,
-                        "content_block": {"type": "text", "text": ""},
-                    },
-                ),
-                (
-                    "content_block_delta",
-                    {
-                        "type": "content_block_delta",
-                        "index": 0,
-                        "delta": {"type": "text_delta", "text": account},
-                    },
-                ),
-                ("content_block_stop", {"type": "content_block_stop", "index": 0}),
-                (
-                    "message_delta",
-                    {
-                        "type": "message_delta",
-                        "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-                        "usage": {"output_tokens": 1},
-                    },
-                ),
-                ("message_stop", {"type": "message_stop"}),
-            ]
-            for event, payload in events:
-                self.wfile.write(
-                    (
-                        "event: " + event + "\ndata: " + json.dumps(payload) + "\n\n"
-                    ).encode()
-                )
-            self.wfile.flush()
+            self.send_json(200, message, headers)
 
         def log_message(self, format, *args):
             pass
@@ -223,7 +155,7 @@ def main():
                     "-subj",
                     "/CN=api.anthropic.com",
                     "-addext",
-                    "subjectAltName=DNS:api.anthropic.com,DNS:chatgpt.com",
+                    "subjectAltName=DNS:api.anthropic.com",
                 ],
                 check=True,
                 capture_output=True,
@@ -241,19 +173,15 @@ def main():
             (auths / (account + ".json")).write_text(
                 json.dumps(
                     {
-                        "type": "claude" if account in claude_ids else "codex",
-                        "access_token": (
-                            "sk-ant-oat-test-"
-                            if account in claude_ids
-                            else "codex-token-"
-                        )
-                        + account,
-                        "account_uuid": account if account in claude_ids else "",
-                        "account_id": account if account in codex_ids else "",
+                        "type": "claude",
+                        "access_token": "sk-ant-oat-test-" + account,
+                        "refresh_token": "synthetic-refresh-" + account,
+                        "account_uuid": account,
                         "email": account + "@example.invalid",
                         "expired": "2099-01-01T00:00:00Z",
-                        "last_refresh": deadline(0),
-                        "disabled": False,
+                        # Older than the plugin's recent-refresh guard, so writes are not deferred.
+                        "last_refresh": (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1)).isoformat(),
+                        "note": "<keep & me>",
                         "priority": 0,
                     }
                 )
@@ -272,7 +200,7 @@ remote-management:
   disable-control-panel: true
 routing:
   strategy: fill-first
-  session-affinity: false
+  session-affinity: true
 request-retry: 3
 max-retry-credentials: 0
 max-retry-interval: 1
@@ -284,6 +212,9 @@ plugins:
       enabled: true
       priority: 10
       mode: shadow
+      accounts:
+        BETA@example.invalid:
+          five_hour_reserve: 10
 """)
         log = (root / "host.log").open("w+")
         env = dict(os.environ, SSL_CERT_FILE=str(cert), GOMEMLIMIT="256MiB")
@@ -299,7 +230,7 @@ plugins:
         )
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
-        def api(path, method="GET", body=None, management=True):
+        def api(path, method="GET", body=None, management=True, headers=None):
             key = "synthetic-management-key" if management else "synthetic-client-key"
             request = urllib.request.Request(
                 "http://127.0.0.1:18318" + path,
@@ -307,13 +238,21 @@ plugins:
                 headers={
                     "Authorization": "Bearer " + key,
                     "Content-Type": "application/json",
+                    **(headers or {}),
                 },
                 method=method,
             )
-            with opener.open(request, timeout=15) as response:
-                return response.read()
+            try:
+                with opener.open(request, timeout=15) as response:
+                    return response.read()
+            except urllib.error.HTTPError as exc:
+                # Still a URLError, so wait_for keeps retrying, but with the body.
+                raise urllib.error.URLError(
+                    f"{method} {path}: HTTP {exc.code}: {exc.read()[:500]!r}"
+                ) from None
 
-        def wait_for(check, label, timeout=25):
+        # The plugin reconciles every 30 s, so waits for writes allow a full cycle.
+        def wait_for(check, label, timeout=45):
             end = time.monotonic() + timeout
             last = None
             while time.monotonic() < end:
@@ -321,8 +260,8 @@ plugins:
                     last = check()
                     if last:
                         return last
-                except (urllib.error.URLError, ValueError) as exc:
-                    last = str(exc)
+                except (urllib.error.URLError, ValueError, KeyError) as exc:
+                    last = repr(exc)
                 if proc.poll() is not None:
                     raise AssertionError("CPA exited during " + label)
                 time.sleep(0.2)
@@ -331,113 +270,139 @@ plugins:
         def status():
             return json.loads(api(STATUS))
 
-        def ready(mode):
-            s = status()
-            return (
-                s["mode"] == mode
-                and len(s["accounts"]) == len(ids)
-                and all(a.get("quota") for a in s["accounts"].values())
+        def account_status(account):
+            return status()["accounts"].get(account + ".json") or {}
+
+        def observed(account):
+            state = account_status(account)
+            return state.get("source") == "headers" and state.get("seven_day", {}).get(
+                "resets_at"
             )
 
-        def configure(mode, interval="5m"):
-            api(CONFIG, "PATCH", {"mode": mode, "poll_interval": interval})
-            wait_for(
-                lambda: (
-                    ready(mode)
-                    and status()["poll_interval"]
-                    == ("5m0s" if interval == "5m" else "1m0s")
-                ),
-                "plugin reconfigure",
-            )
+        def stored(account):
+            return json.loads((auths / (account + ".json")).read_text())
 
-        def message(stream=False):
-            raw = api(
-                "/v1/messages",
-                "POST",
-                {
-                    "model": MODEL,
-                    "max_tokens": 16,
-                    "stream": stream,
-                    "messages": [{"role": "user", "content": "Synthetic routing test"}],
-                },
-                False,
-            )
-            if stream:
-                return raw.decode()
+        def set_disabled(account, disabled):
+            api(AUTH_STATUS, "PATCH", {"name": account + ".json", "disabled": disabled})
+
+        def message(session):
+            # CPA rebuilds its model registry after startup and after an auth status
+            # change; until then it answers "unknown provider", which never reaches the
+            # scheduler, so only that error is retried.
+            def send():
+                try:
+                    return api(
+                        "/v1/messages",
+                        "POST",
+                        {
+                            "model": MODEL,
+                            "max_tokens": 16,
+                            "messages": [
+                                {"role": "user", "content": "Synthetic routing test"}
+                            ],
+                        },
+                        False,
+                        {"X-Claude-Code-Session-Id": session},
+                    )
+                except urllib.error.URLError as exc:
+                    if "unknown provider" in str(exc.reason):
+                        return None
+                    # Any other failure is real: escape wait_for instead of retrying.
+                    raise AssertionError(str(exc.reason)) from None
+
+            raw = wait_for(send, "model " + MODEL + " registered", timeout=15)
             return json.loads(raw)["content"][0]["text"]
 
+        def registered():
+            listing = json.loads(api(PLUGINS))
+            entry = next((p for p in listing["plugins"] if p["id"] == PLUGIN), None)
+            return entry and entry["registered"] and entry
+
         try:
-            wait_for(lambda: ready("shadow"), "startup and quota discovery")
-            assert status()["version"] == "0.2.1"
-            assert status()["selection_policy"] == "weekly_reset_first"
-            assert message() == "a-seven-days", "shadow changed built-in routing"
-            assert status()["last_decision"]["auth_id"] == "z-five-hours.json"
-            assert status()["last_decision"]["reason"] == "earliest_weekly_reset"
-            configure("active")
-            assert message() == "z-five-hours"
-            assert "z-five-hours" in message(True), "streaming routing failed"
-            with ThreadPoolExecutor(max_workers=8) as pool:
-                assert (
-                    list(pool.map(lambda _: message(), range(32)))
-                    == ["z-five-hours"] * 32
-                )
-            end, soaked = time.monotonic() + soak, 0
-            with ThreadPoolExecutor(max_workers=16) as pool:
-                while time.monotonic() < end:
-                    replies = list(pool.map(lambda i: message(i % 4 == 0), range(64)))
-                    assert all("z-five-hours" in r for r in replies), (
-                        "soak routing failed"
-                    )
-                    soaked += len(replies)
-            exhausted.add("z-five-hours")
-            configure("active", "1m")
-            assert message() == "c-one-day", "short-window exhausted account selected"
-            exhausted.clear()
-            durations["z-five-hours"] = 169
-            configure("active")
-            assert message() == "c-one-day", "reset rollover ordering failed"
-            quota_failure = True
-            api(CONFIG, "PATCH", {"poll_interval": "1m"})
+            # a. The plugin registers and tracks both accounts.
+            entry = wait_for(registered, "plugin registration")
+            assert entry["metadata"]["version"] == "0.4.0", entry["metadata"]
+            wait_for(
+                lambda: len(status()["accounts"]) == len(ids), "account discovery"
+            )
+            data = status()
+            assert data["mode"] == "shadow" and data["version"] == "0.4.0", data
+
+            # b. Learn both accounts from response headers. With equal priorities
+            # fill-first takes alpha, so beta is reached while alpha is disabled.
+            set_disabled("alpha", True)
+            assert message("probe-beta") == "beta"
+            wait_for(lambda: observed("beta"), "beta header observation")
+            set_disabled("alpha", False)
+            wait_for(lambda: account_status("alpha"), "alpha back in the roster")
+            assert message("session-bound-alpha") == "alpha"
+            wait_for(lambda: observed("alpha"), "alpha header observation")
+            before = {account: stored(account) for account in ids}
+            planned = {
+                account: account_status(account)["planned_priority"] for account in ids
+            }
+            assert planned == {"beta": 20, "alpha": 10}, planned
+            assert all(before[a]["priority"] == 0 for a in ids), "shadow wrote a file"
+            assert status()["priority_writes"] == 0
+
+            api(CONFIG, "PATCH", {"mode": "active"})
             wait_for(
                 lambda: (
-                    status()["poll_interval"] == "1m0s"
-                    and all(
-                        a.get("last_error") == "quota_http_503"
-                        for a in status()["accounts"].values()
-                    )
+                    stored("beta").get("priority") == 20
+                    and stored("alpha").get("priority") == 10
                 ),
-                "quota outage",
+                "priority rewrite in the auth files",
             )
-            assert message() == "a-seven-days", (
-                "quota outage did not delegate to fill-first"
-            )
-            quota_failure = False
-            durations["z-five-hours"] = 5
-            configure("active")
-            reject_messages.add("z-five-hours")
-            assert message() == "c-one-day", (
-                "host 429 retry did not select next available account"
-            )
-            api(
-                "/v0/management/plugins/" + PLUGIN + "/enabled",
-                "PATCH",
-                {"enabled": False},
-            )
-            wait_for(
-                lambda: message() == "a-seven-days",
-                "disable and original routing recovery",
-            )
-            for path in auths.glob("*.json"):
-                stored = json.loads(path.read_text())
-                assert stored.get("priority", 0) == 0 and not stored.get("disabled"), (
-                    "credential routing fields changed"
+            for account in ids:
+                after = stored(account)
+                assert dict(after, priority=0) == before[account], (
+                    "auth file lost fields",
+                    account,
                 )
+            assert account_status("beta")["last_write"] == "ok"
+
+            # c. The bound session stays; a new session goes to the new top.
+            assert message("session-bound-alpha") == "alpha", "binding was broken"
+            assert message("session-new-1") == "beta", "new session missed the top"
+            sessions = itertools.count()
+            end, soaked = time.monotonic() + soak, 0
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                while True:
+                    replies = list(
+                        pool.map(
+                            lambda _: message("soak-" + str(next(sessions))), range(32)
+                        )
+                    )
+                    assert replies == ["beta"] * 32, "new sessions left the top"
+                    soaked += len(replies)
+                    if time.monotonic() >= end:
+                        break
+
+            # d. beta crosses its 10% five-hour reserve on its next response.
+            limits["beta"]["5h"] = (0.95, start + 3 * 3600)
+            assert message("session-new-1") == "beta"
+            wait_for(lambda: account_status("beta").get("at_reserve"), "beta at reserve")
+            assert message("session-new-2") == "alpha", "at-reserve account selected"
+            last_pick = status()["last_pick"]
+            assert last_pick["applied"] and last_pick["would_exclude"] == [
+                "beta.json"
+            ], last_pick
+            assert message("session-new-3") == "alpha", "at-reserve account selected"
+            set_disabled("alpha", True)
+            assert message("session-new-4") == "beta", (
+                "the only account was excluded"
+            )
+            set_disabled("alpha", False)
             assert not fixture_errors, fixture_errors
+            assert set(usage_polls) <= set(ids)
+            text = json.dumps(status())
+            assert "sk-ant-oat-test" not in text and "synthetic-refresh" not in text
             soak_note = f"{soaked} requests in a {soak:.0f} s soak, " if soak else ""
             print(
-                "PASS: official release checksum verified; shadow/active, streaming, 32 concurrent requests, "
+                "PASS: official release checksum verified; registration, header-driven "
+                "priority rewrite that keeps auth fields, session affinity kept, "
                 + soak_note
-                + "exhaustion, reset rollover, quota outage, 429 failover, hot-disable rollback; RSS "
+                + "reserve exclusion and last-account fallback; RSS "
                 + rss_kib(proc.pid)
                 + " KiB"
             )

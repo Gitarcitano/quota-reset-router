@@ -1,4 +1,8 @@
-"""Exercise the release .so with CPA's exact C ABI and an isolated HTTPS fixture."""
+"""Exercise the release .so with CPA's exact C ABI and an isolated HTTPS fixture.
+
+The host side is simulated in Python: auth list/get/save/log callbacks, usage
+records and scheduler picks. The plugin must never pick an account itself.
+"""
 
 import base64
 import ctypes as C
@@ -56,15 +60,27 @@ def main():
     libc.malloc.argtypes, libc.malloc.restype = [C.c_size_t], C.c_void_p
     libc.free.argtypes = [C.c_void_p]
     claude_ids = ["a-seven-days", "b-two-days", "c-one-day", "z-five-hours"]
-    codex_ids = ["codex-later", "codex-sooner"]
-    ids = claude_ids + codex_ids
+    ids = claude_ids + ["codex-ignored"]
     durations = dict(zip(claude_ids, [168, 48, 24, 5]))
-    durations.update({"codex-later": 48, "codex-sooner": 5})
-    exhausted = set()
+    files = {
+        i: {
+            "type": "claude" if i in claude_ids else "codex",
+            "access_token": ("test-token-" if i in claude_ids else "codex-token-") + i,
+            "refresh_token": "refresh-secret-" + i,
+            "email": i + "@example.invalid",
+            "note": "<keep & me>",
+            "nested": {"list": [1, 2, 3]},
+            "priority": 0,
+        }
+        for i in ids
+    }
+    original = json.loads(json.dumps(files))
     allocations = set()
     callback_errors = []
     methods = set()
     upstream_requests = []
+    saves = []
+    lock = threading.Lock()
 
     def deadline(hours):
         return (
@@ -73,52 +89,21 @@ def main():
 
     class Fixture(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
-            token = (
-                self.headers.get("Authorization", "")
-                .removeprefix("Bearer test-token-")
-                .removeprefix("Bearer codex-token-")
+            token = self.headers.get("Authorization", "").removeprefix(
+                "Bearer test-token-"
             )
-            assert token in durations
+            assert token in durations and self.path == "/api/oauth/usage"
+            assert self.headers.get("anthropic-beta") == "oauth-2025-04-20"
             upstream_requests.append(token)
-            if self.path == "/api/oauth/usage":
-                assert self.headers.get("anthropic-beta") == "oauth-2025-04-20"
-                body = json.dumps(
-                    {
-                        "seven_day": {
-                            "utilization": 20,
-                            "resets_at": deadline(durations[token]),
-                        },
-                        "five_hour": {
-                            "utilization": 100 if token in exhausted else 0,
-                            "resets_at": deadline(2)
-                            if token in exhausted
-                            else deadline(1)
-                            if token == claude_ids[0]
-                            else None,
-                        },
-                    }
-                ).encode()
-            else:
-                assert self.path == "/backend-api/wham/usage"
-                body = json.dumps(
-                    {
-                        "plan_type": "plus",
-                        "rate_limit": {
-                            "primary_window": {
-                                "used_percent": 20,
-                                "limit_window_seconds": 18000,
-                                "reset_after_seconds": 3600
-                                if token == "codex-later"
-                                else 14400,
-                            },
-                            "secondary_window": {
-                                "used_percent": 20,
-                                "limit_window_seconds": 604800,
-                                "reset_after_seconds": durations[token] * 3600,
-                            },
-                        },
-                    }
-                ).encode()
+            body = json.dumps(
+                {
+                    "seven_day": {
+                        "utilization": 20,
+                        "resets_at": deadline(durations[token]),
+                    },
+                    "five_hour": {"utilization": 0, "resets_at": None},
+                }
+            ).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -135,35 +120,44 @@ def main():
             method = method.decode()
             methods.add(method)
             data = json.loads(C.string_at(request, length))
-            if method == "host.auth.list":
-                result = {
-                    "files": [
-                        {
-                            "id": i,
-                            "name": i + ".json",
-                            "auth_index": i,
-                            "provider": "claude" if i in claude_ids else "codex",
-                        }
-                        for i in ids
-                    ]
-                }
-            elif method == "host.auth.get":
-                i = data["auth_index"]
-                assert i in ids
-                result = {
-                    "auth_index": i,
-                    "json": {
-                        "type": "claude" if i in claude_ids else "codex",
-                        "access_token": (
-                            "test-token-" if i in claude_ids else "codex-token-"
-                        )
-                        + i,
-                        "account_uuid": i if i in claude_ids else "",
-                        "account_id": i if i in codex_ids else "",
-                    },
-                }
-            else:
-                raise AssertionError("Unexpected host capability: " + method)
+            with lock:
+                if method == "host.auth.list":
+                    result = {
+                        "files": [
+                            {
+                                "id": i,
+                                "name": i + ".json",
+                                "auth_index": "idx-" + i,
+                                "provider": files[i]["type"],
+                                "type": files[i]["type"],
+                                "status": "active",
+                                "email": files[i]["email"],
+                                "priority": files[i]["priority"],
+                            }
+                            for i in ids
+                        ]
+                    }
+                elif method == "host.auth.get":
+                    i = data["auth_index"].removeprefix("idx-")
+                    assert i in ids
+                    result = {
+                        "auth_index": data["auth_index"],
+                        "name": i + ".json",
+                        "path": "/auths/" + i + ".json",
+                        "json": files[i],
+                    }
+                elif method == "host.auth.save":
+                    i = data["name"].removesuffix(".json")
+                    assert i in claude_ids, "saved a non-Claude credential"
+                    files[i] = data["json"]
+                    saves.append((i, data["json"]["priority"]))
+                    result = {"name": data["name"], "path": "/auths/" + data["name"]}
+                elif method == "host.log":
+                    text = json.dumps(data)
+                    assert "token-" not in text and "secret" not in text, text
+                    result = {}
+                else:
+                    raise AssertionError("Unexpected host capability: " + method)
             raw = json.dumps({"ok": True, "result": result}).encode()
             pointer = libc.malloc(len(raw))
             C.memmove(pointer, raw, len(raw))
@@ -181,6 +175,14 @@ def main():
             return
         allocations.remove(pointer)
         libc.free(pointer)
+
+    def wait_for(check, label, timeout=20):
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            if check():
+                return
+            time.sleep(0.02)
+        raise AssertionError(label + ": callbacks=" + repr(callback_errors))
 
     with tempfile.TemporaryDirectory(prefix="quota-reset-router-native-") as tmp:
         cert, key = Path(os.environ["SSL_CERT_FILE"]), Path(tmp) / "key.pem"
@@ -201,7 +203,7 @@ def main():
                 "-subj",
                 "/CN=api.anthropic.com",
                 "-addext",
-                "subjectAltName=DNS:api.anthropic.com,DNS:chatgpt.com",
+                "subjectAltName=DNS:api.anthropic.com",
             ],
             check=True,
             capture_output=True,
@@ -247,96 +249,100 @@ def main():
             )
             return json.loads(base64.b64decode(result["Body"]))
 
-        def configure(mode, method="plugin.reconfigure"):
-            payload = {
-                "config_yaml": base64.b64encode(("mode: " + mode).encode()).decode()
-            }
+        def configure(yaml_text, method="plugin.reconfigure"):
+            payload = {"config_yaml": base64.b64encode(yaml_text.encode()).decode()}
             reg = call(method, payload)
-            assert reg["schema_version"] == 6
-            assert reg["capabilities"] == {"scheduler": True, "management_api": True}
-            end = time.monotonic() + 20
-            while time.monotonic() < end:
-                data = status()
-                if len(data["accounts"]) == len(ids) and all(
-                    a.get("quota") for a in data["accounts"].values()
-                ):
-                    return
-                time.sleep(0.02)
-            raise AssertionError(
-                "quota refresh did not complete: "
-                + json.dumps(status())
-                + " callbacks="
-                + repr(callback_errors)
-                + " upstream="
-                + repr(upstream_requests)
-            )
+            assert reg["schema_version"] == 10, reg
+            assert reg["capabilities"] == {
+                "scheduler": True,
+                "scheduler_across_priorities": True,
+                "usage_plugin": True,
+                "management_api": True,
+            }, reg
+
+        def assert_no_pick(result):
+            assert not result.get("Handled") and not result.get("AuthID"), result
+            assert not result.get("Reject"), result
 
         request = {
             "Provider": "claude",
             "Providers": ["claude"],
             "Model": "claude-sonnet-4-6",
             "Candidates": [
-                {
-                    "ID": i,
-                    "Provider": "claude",
-                    "Status": "active",
-                    "Metadata": {"account_uuid": i},
-                }
+                {"ID": i, "Provider": "claude", "Status": "active"} for i in claude_ids
+            ],
+        }
+        reserve = "accounts:\n  z-five-hours@example.invalid:\n    five_hour_reserve: 10\n"
+        configure("mode: shadow\n" + reserve, "plugin.register")
+        wait_for(
+            lambda: all(
+                (status()["accounts"].get(i) or {}).get("seven_day", {}).get("resets_at")
                 for i in claude_ids
-            ],
-        }
-        configure("shadow", "plugin.register")
-        assert status()["version"] == "0.2.1"
-        assert status()["selection_policy"] == "weekly_reset_first"
-        assert not call("scheduler.pick", request)["Handled"]
-        assert status()["last_decision"]["auth_id"] == "z-five-hours"
-        assert status()["last_decision"]["reason"] == "earliest_weekly_reset"
-        configure("active")
-        for expected in reversed(claude_ids):
-            result = call("scheduler.pick", request)
-            assert result["Handled"] and result["AuthID"] == expected, result
-            request["Candidates"] = [
-                c for c in request["Candidates"] if c["ID"] != expected
-            ]
-        request["Candidates"] = [
-            {"ID": i, "Provider": "claude", "Metadata": {"account_uuid": i}}
-            for i in claude_ids
-        ]
-        exhausted.add("z-five-hours")
-        configure("active")
-        assert call("scheduler.pick", request)["AuthID"] == "c-one-day"
-        exhausted.clear()
-        durations["z-five-hours"] = 169
-        configure("active")
-        assert call("scheduler.pick", request)["AuthID"] == "c-one-day"
-        for i in range(500):
-            assert call("scheduler.pick", request)["AuthID"] == "c-one-day"
-        codex_request = {
-            "Provider": "codex",
-            "Providers": ["codex"],
-            "Model": "gpt-5-codex",
-            "Candidates": [
-                {"ID": i, "Provider": "codex", "Status": "active"} for i in codex_ids
-            ],
-        }
-        assert call("scheduler.pick", codex_request)["AuthID"] == "codex-sooner"
-        codex_request["Candidates"] = [
-            {"ID": "codex-later", "Provider": "codex", "Status": "active"}
-        ]
-        assert call("scheduler.pick", codex_request)["AuthID"] == "codex-later"
-        assert all(
-            p not in json.dumps(status()) for p in ("test-token-", "codex-token-")
+            ),
+            "quota polls",
         )
+        data = status()
+        assert data["version"] == "0.4.0" and data["mode"] == "shadow", data
+        assert "codex-ignored" not in data["accounts"], "Codex account tracked"
+        planned = {i: data["accounts"][i]["planned_priority"] for i in claude_ids}
+        assert planned == {
+            "z-five-hours": 40,
+            "c-one-day": 30,
+            "b-two-days": 20,
+            "a-seven-days": 10,
+        }, planned
+        assert_no_pick(call("scheduler.pick", request))
+        assert not call("scheduler.pick", request).get("ExcludeCandidates")
+        assert not saves, "shadow mode wrote a priority"
+
+        configure("mode: active\n" + reserve)
+        wait_for(lambda: len(saves) == 4, "priority writes")
+        for i in claude_ids:
+            expected = dict(original[i], priority=planned[i])
+            assert files[i] == expected, (i, files[i])
+        assert files["codex-ignored"] == original["codex-ignored"]
+
+        # A usage record crosses the 10% five-hour reserve of z-five-hours.
+        reset = int(time.time()) + 3600
+        call(
+            "usage.handle",
+            {
+                "AuthID": "z-five-hours",
+                "Provider": "claude",
+                "ResponseHeaders": {
+                    "anthropic-ratelimit-unified-5h-utilization": ["0.95"],
+                    "anthropic-ratelimit-unified-5h-reset": [str(reset)],
+                    "anthropic-ratelimit-unified-5h-status": ["allowed"],
+                },
+            },
+        )
+        assert status()["accounts"]["z-five-hours"]["at_reserve"]
+        result = call("scheduler.pick", request)
+        assert_no_pick(result)
+        assert result.get("ExcludeCandidates") == ["z-five-hours"], result
+        only = dict(request, Candidates=request["Candidates"][-1:])
+        result = call("scheduler.pick", only)
+        assert_no_pick(result)
+        assert not result.get("ExcludeCandidates"), "excluded the only account"
+        for _ in range(500):
+            assert_no_pick(call("scheduler.pick", request))
+        text = json.dumps(status())
+        assert "token-" not in text and "secret" not in text, "status leaked a token"
         call("plugin.quiesce", {})
-        assert not call("scheduler.pick", request)["Handled"]
+        result = call("scheduler.pick", request)
+        assert_no_pick(result)
+        assert not result.get("ExcludeCandidates")
         api.shutdown()
         assert not allocations, "host response buffer leak"
         assert not callback_errors, callback_errors
-        assert methods == {"host.auth.list", "host.auth.get"}, methods
-        assert len(upstream_requests) >= 16, upstream_requests
+        assert methods <= {"host.auth.list", "host.auth.get", "host.auth.save", "host.log"}
+        assert {"host.auth.list", "host.auth.get", "host.auth.save"} <= methods, methods
+        assert sorted(upstream_requests) == sorted(claude_ids), upstream_requests
         server.shutdown()
         print(
-            "PASS: release .so native ABI, TLS quota reads, shadow/active routing, reset rollover, exhaustion, 500 picks, quiesce, buffer ownership; no host writes"
+            "PASS: release .so native ABI, TLS quota reads, shadow plan, active priority writes "
+            "that keep other fields, usage headers, reserve exclusion, 500 picks without a "
+            "selection, quiesce, buffer ownership"
         )
 
 
