@@ -1,6 +1,6 @@
 # quota-reset-router
 
-A [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) scheduler plugin for Claude and Codex OAuth accounts. It routes each request to the eligible account whose **weekly quota resets soonest**, so quota that would otherwise expire unused is consumed first.
+A [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) scheduler plugin for Claude and Codex OAuth accounts. It keeps a session on the same account, then routes a new session to the eligible account whose **7-day quota resets soonest**, and it can hold each account under a 5-hour cap and a 7-day cap.
 
 - **Author:** Shreyash ([webdevcaptain](https://github.com/webdevcaptain))
 - **License:** [MIT](LICENSE)
@@ -10,10 +10,12 @@ A [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) scheduler plugin f
 ## Selection rules
 
 - Claude and Codex pools are ranked independently. Requests spanning multiple providers are left to CLIProxyAPI.
-- **Rank:** earliest weekly reset first. Ties are ordered by credential ID.
-- **Skip:** accounts whose five-hour, weekly, or model-specific (Sonnet/Opus) quota is exhausted.
-- Existing credential `priority` tiers still take precedence.
-- Only candidates offered by CLIProxyAPI are considered, so its model eligibility, cooldowns, and retries still apply.
+- **Session affinity:** a session stays on the account already chosen for it until `session_ttl` (default 1h), while that account remains eligible. The host's own affinity lookup is unavailable once a scheduler plugin is active, so the plugin keeps this binding itself. WebSockets stay in the Codex client config (`supports_websockets`); this plugin does not change the transport.
+- **Rank:** higher credential `priority` first, then an account inside its release window, then the earliest 7-day reset. Ties are ordered by credential ID.
+- **Caps:** `weekly_cap` blocks an account at that 7-day utilization. Inside `release_before` before the 7-day reset (default 5h, per account if set), the weekly cap is lifted and the account is preferred. `five_hour_cap` still applies inside that window.
+- **Skip:** accounts whose five-hour, weekly, model-specific (Sonnet/Opus), or configured cap is exhausted, and accounts whose quota is missing or older than `max_age`.
+- In `active` mode the plugin rejects the request when no Claude or Codex candidate satisfies the policy, instead of falling back to round-robin. `shadow` only records the decision.
+- Only candidates offered by CLIProxyAPI are considered, so its model eligibility, cooldowns, and retries still apply. `scheduler_across_priorities` is enabled so a lower-priority account can be used when every higher-priority account is over its cap.
 - Codex: the earliest reset among its weekly or monthly windows is used for ranking.
 
 Example: account A (weekly reset in 20 hours) is chosen over account B (weekly reset in 4 days), even if B's five-hour window resets in 2 hours. If A is exhausted, B is chosen.
@@ -40,7 +42,7 @@ Ordering is not guaranteed in these cases. Quota can also change between refresh
 
 ## Requirements
 
-- CLIProxyAPI v7.3.15 (plugin ABI 1, schema 6). Other versions are untested.
+- CLIProxyAPI v8.0.65 (plugin ABI 1, schema 10). Other versions are untested.
 - Linux amd64 or arm64 (glibc 2.34 or newer), macOS 12 or newer on Apple silicon or Intel, or Windows amd64.
 - The Intel macOS build uses a patched Go toolchain. See [Intel Macs](#intel-macs).
 - Direct network access to both quota endpoints. Credentials with `proxy_url` or `base_url` are skipped. Quota polling ignores CLIProxyAPI's `proxy-url` and proxy environment variables.
@@ -75,6 +77,13 @@ Ordering is not guaranteed in these cases. Quota can also change between refresh
 | `poll_interval` | `5m` | `1m` to `1h` | Quota refresh interval. |
 | `max_age` | `10m` | `poll_interval` to `1h` | Maximum age of cached quota. |
 | `request_timeout` | `10s` | `1s` to `30s` | Timeout per quota request. |
+| `five_hour_cap` | `100` | `0` to `100` | Default 5-hour utilization cap. |
+| `weekly_cap` | `100` | `0` to `100` | Default 7-day utilization cap. |
+| `release_before` | `5h` | `0s` to `48h` | How long before the 7-day reset the weekly cap is lifted. |
+| `session_ttl` | `1h` | `0s` to `24h` | How long a session stays on the same eligible account. `0s` disables affinity. |
+| `accounts` | empty | map | Per-account `five_hour_cap`, `weekly_cap`, and `release_before`. |
+
+The management panel registers a **Cotas** page at `/v0/resource/plugins/quota-reset-router/panel`. It lists each account, the last 5-hour and 7-day reading, the next reset, and why the account is available or blocked, including a stale reading. Saving sends `PATCH /v0/management/plugins/quota-reset-router/config` with the management key. The percentage is the last poll, not a live counter.
 
 Change settings without a restart:
 
@@ -128,7 +137,7 @@ make zip          # writes dist/release/quota-reset-router_<version>_<target>.zi
 make load-test    # loads the zip into the official CLIProxyAPI; TARGET must match this machine
 ```
 
-- `host-test` and `load-test` download the official CLIProxyAPI v7.3.15 release and verify its checksum.
+- `host-test` and `load-test` download the official CLIProxyAPI v8.0.65 release and verify its checksum.
 - `native-test` and `host-test` run with networking disabled, local TLS fixtures, and synthetic credentials. On macOS, `host-test` instead needs the quota hosts pinned to 127.0.0.1 and the fixture certificate trusted in the System keychain, which CI sets up; `SOAK_SECONDS` adds a soak under GC pressure.
 - `load-test` starts CLIProxyAPI without credentials, so the plugin makes no network requests.
 - CI builds every target and loads each zip into the official CLIProxyAPI on its own platform.
@@ -136,7 +145,7 @@ make load-test    # loads the zip into the official CLIProxyAPI; TARGET must mat
 
 ### Intel Macs
 
-Stock Go on macOS amd64 keeps each thread's current goroutine in one fixed thread-local slot, slot 6, which Apple reserves for Go. Every Go runtime in a process uses that slot. CLIProxyAPI is itself a Go program, so a plugin built with stock Go runs on CLIProxyAPI's goroutines and heap, and CLIProxyAPI v7.3.15 crashes at startup (`fatal error: addspecial on invalid pointer`; CLIProxyAPI's own Go scheduler example fails with `unknown caller pc`). Linux, Windows, and Apple silicon give each runtime its own slot, so they are unaffected.
+Stock Go on macOS amd64 keeps each thread's current goroutine in one fixed thread-local slot, slot 6, which Apple reserves for Go. Every Go runtime in a process uses that slot. CLIProxyAPI is itself a Go program, so a plugin built with stock Go runs on CLIProxyAPI's goroutines and heap, and CLIProxyAPI crashes at startup (`fatal error: addspecial on invalid pointer`; CLIProxyAPI's own Go scheduler example fails with `unknown caller pc`). Linux, Windows, and Apple silicon give each runtime its own slot, so they are unaffected.
 
 The `darwin_amd64` library is built with Go 1.26.8 plus [`scripts/go-tls-slot.patch`](scripts/go-tls-slot.patch). The patch changes two constants so the plugin's runtime uses slot 11, which Apple also reserves and leaves unused. CLIProxyAPI keeps slot 6. The toolchain is built from the checksum-verified upstream source, and the build fails if any goroutine access in the library still uses slot 6.
 

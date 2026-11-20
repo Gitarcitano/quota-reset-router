@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
 func TestConfigValidation(t *testing.T) {
@@ -18,7 +18,7 @@ func TestConfigValidation(t *testing.T) {
 			t.Fatalf("valid config %q: %v", raw, err)
 		}
 	}
-	for _, raw := range []string{"mode: wrong", "poll_interval: 1s", "poll_interval: 2h", "max_age: 1m", "max_age: 2h", "request_timeout: 0s", "request_timeout: 31s", "poll_interval: invalid"} {
+	for _, raw := range []string{"mode: wrong", "poll_interval: 1s", "poll_interval: 2h", "max_age: 1m", "max_age: 2h", "request_timeout: 0s", "request_timeout: 31s", "poll_interval: invalid", "weekly_cap: 101", "release_before: 49h", "session_ttl: 25h", "accounts:\n  a:\n    weekly_cap: -1"} {
 		if _, err := decodeConfig([]byte(raw)); err == nil {
 			t.Fatalf("invalid config accepted: %q", raw)
 		}
@@ -53,7 +53,7 @@ func TestRuntimeRegistrationReconfigureShutdown(t *testing.T) {
 	if env := decodeEnvelope(t, p.handle(pluginabi.MethodPluginRegister, []byte(`{}`)), &reg); !env.OK {
 		t.Fatalf("register: %s", env.Error)
 	}
-	if reg.SchemaVersion != 6 || !reg.Capabilities["scheduler"] || !reg.Capabilities["management_api"] || len(reg.Capabilities) != 2 {
+	if reg.SchemaVersion != pluginabi.SchemaVersion || !reg.Capabilities["scheduler"] || !reg.Capabilities["scheduler_across_priorities"] || !reg.Capabilities["management_api"] || len(reg.Capabilities) != 3 {
 		t.Fatalf("unexpected capabilities: %+v", reg)
 	}
 	if p.active.Load().cfg.Mode != "shadow" {
@@ -97,6 +97,11 @@ func TestRuntimeManagementIsReadOnlyAndSanitized(t *testing.T) {
 	}
 	if strings.Contains(string(response.Body), "SECRET_TOKEN") {
 		t.Fatal("secret leaked")
+	}
+	request, _ = json.Marshal(pluginapi.ManagementRequest{Method: "GET", Path: panelPath})
+	decodeEnvelope(t, p.handle(pluginabi.MethodManagementHandle, request), &response)
+	if response.StatusCode != 200 || !strings.Contains(string(response.Body), "Cotas") {
+		t.Fatal("panel was not served")
 	}
 	for _, method := range []string{"POST", "PATCH", "DELETE"} {
 		request, _ = json.Marshal(pluginapi.ManagementRequest{Method: method, Path: statusPath})

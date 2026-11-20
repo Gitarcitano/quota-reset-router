@@ -4,7 +4,7 @@ Binary releases of quota-reset-router statically link code from the projects bel
 
 ## CLIProxyAPI plugin SDK
 
-- Module: `github.com/router-for-me/CLIProxyAPI/v7` v7.3.15 (packages `sdk/pluginabi`, `sdk/pluginapi`)
+- Module: `github.com/router-for-me/CLIProxyAPI/v8` v8.0.65 (packages `sdk/pluginabi`, `sdk/pluginapi`)
 - License: MIT
 
 ```text

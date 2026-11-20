@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
 var testNow = time.Date(2026, 9, 23, 12, 0, 0, 0, time.UTC)
@@ -289,7 +289,7 @@ func TestRefreshCadenceRemovalAndBackoff(t *testing.T) {
 		t.Fatal("fresh last-known quota was discarded")
 	}
 	*now = now.Add(5 * time.Minute)
-	if got := e.pick(testRequest("a")); got.Handled {
+	if got := e.pick(testRequest("a")); got.AuthID != "" || !got.Reject {
 		t.Fatal("stale last-known quota used")
 	}
 	host.entries = nil
@@ -317,7 +317,7 @@ func TestRefreshFailureSanitizationAndRevocation(t *testing.T) {
 	if e.states["a"].Snapshot != nil {
 		t.Fatal("revoked credential kept trusted quota")
 	}
-	if got := e.pick(testRequest("a")); got.Handled {
+	if got := e.pick(testRequest("a")); got.AuthID != "" || !got.Reject {
 		t.Fatal("selected revoked credential")
 	}
 }
@@ -384,8 +384,47 @@ func TestRosterReplacementInvalidatesCacheBeforeNextPoll(t *testing.T) {
 	}
 	req := testRequest("a")
 	req.Candidates[0].Metadata = nil
-	if got := e.pick(req); got.Handled {
+	if got := e.pick(req); got.AuthID != "" || !got.Reject {
 		t.Fatal("replaced account was routed with old quota")
+	}
+}
+
+func TestCapsReleaseWindowAndSessionAffinity(t *testing.T) {
+	cfg, err := decodeConfig([]byte("mode: active\nweekly_cap: 15\nfive_hour_cap: 50\nrelease_before: 5h\nsession_ttl: 1h\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := newEngine(&fakeHost{}, fetchFunc(func(context.Context, credential) (quotaSnapshot, error) {
+		return quotaSnapshot{}, nil
+	}), cfg)
+	e.now = func() time.Time { return testNow }
+	burn := testSnapshot("burn", 4*time.Hour)
+	burn.Weekly.Utilization = ptr(80.0)
+	hold := testSnapshot("hold", 48*time.Hour)
+	hold.Weekly.Utilization = ptr(10.0)
+	e.states = map[string]accountState{
+		"burn": {Provider: "claude", Snapshot: &burn},
+		"hold": {Provider: "claude", Snapshot: &hold},
+	}
+	if got := e.pick(testRequest("burn", "hold")); got.AuthID != "burn" || !got.Handled {
+		t.Fatalf("account inside the release window must be usable past the weekly cap: %+v", got)
+	}
+	burn.FiveHour.Utilization = ptr(50.0)
+	if got := e.pick(testRequest("burn", "hold")); got.AuthID != "hold" {
+		t.Fatalf("five-hour cap must hold inside the release window: %+v", got)
+	}
+	burn.FiveHour.Utilization = ptr(0.0)
+	req := testRequest("burn", "hold")
+	req.Options.Headers = map[string][]string{"Session-Id": {"thread-1"}}
+	if got := e.pick(req); got.AuthID != "burn" || e.last.Reason != "session_affinity" && e.last.Reason != "release_window" {
+		t.Fatalf("first session pick: %+v last=%+v", got, e.last)
+	}
+	if got := e.pick(req); got.AuthID != "burn" || e.last.Reason != "session_affinity" {
+		t.Fatalf("session must stay on the eligible account: %+v last=%+v", got, e.last)
+	}
+	burn.Weekly.ResetsAt = ptr(testNow.Add(48 * time.Hour))
+	if got := e.pick(req); got.AuthID != "hold" {
+		t.Fatalf("session must leave an account that is over the weekly cap: %+v", got)
 	}
 }
 

@@ -7,11 +7,12 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
 const statusPath = "/v0/management/plugins/" + pluginID + "/status"
+const panelPath = "/v0/resource/plugins/" + pluginID + "/panel"
 
 type pluginRuntime struct {
 	host    authHost
@@ -69,10 +70,23 @@ func (p *pluginRuntime) handle(method string, raw []byte) []byte {
 		}
 		return success(pluginapi.SchedulerPickResponse{})
 	case pluginabi.MethodManagementRegister:
-		return success(pluginapi.ManagementRegistrationResponse{Routes: []pluginapi.ManagementRoute{{Method: http.MethodGet, Path: statusPath}}})
+		return success(pluginapi.ManagementRegistrationResponse{
+			Routes: []pluginapi.ManagementRoute{{Method: http.MethodGet, Path: statusPath}},
+			Resources: []pluginapi.ResourceRoute{{
+				Path:        "/panel",
+				Menu:        "Cotas",
+				Description: "Limites de 5 horas e 7 dias, afinidade de sessao e a conta que reinicia primeiro.",
+			}},
+		})
 	case pluginabi.MethodManagementHandle:
 		var req pluginapi.ManagementRequest
-		if err := json.Unmarshal(raw, &req); err != nil || req.Method != http.MethodGet || req.Path != statusPath {
+		if err := json.Unmarshal(raw, &req); err != nil || req.Method != http.MethodGet {
+			return success(pluginapi.ManagementResponse{StatusCode: http.StatusNotFound})
+		}
+		if req.Path == panelPath {
+			return success(pluginapi.ManagementResponse{StatusCode: http.StatusOK, Headers: http.Header{"Content-Type": {"text/html; charset=utf-8"}, "Cache-Control": {"no-store"}}, Body: []byte(panelHTML)})
+		}
+		if req.Path != statusPath {
 			return success(pluginapi.ManagementResponse{StatusCode: http.StatusNotFound})
 		}
 		var status any = map[string]string{"state": "stopped"}
@@ -135,11 +149,16 @@ func registration() any {
 	}{
 		pluginabi.SchemaVersion,
 		pluginapi.Metadata{Name: pluginID, Version: pluginVersion, Author: "Shreyash (webdevcaptain)", GitHubRepository: "https://github.com/webdevcaptain/quota-reset-router", ConfigFields: []pluginapi.ConfigField{
-			{Name: "mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"shadow", "active"}, Description: "Shadow records decisions without changing routing. Active selects the earliest weekly reset."},
+			{Name: "mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"shadow", "active"}, Description: "Shadow records decisions without changing routing. Active applies affinity, soonest weekly reset, and the configured caps."},
 			{Name: "poll_interval", Type: pluginapi.ConfigFieldTypeString, Description: "Quota refresh interval, 1m to 1h. Default 5m."},
 			{Name: "max_age", Type: pluginapi.ConfigFieldTypeString, Description: "Maximum quota cache age. Default 10m."},
 			{Name: "request_timeout", Type: pluginapi.ConfigFieldTypeString, Description: "Background quota request timeout, 1s to 30s. Default 10s."},
+			{Name: "five_hour_cap", Type: pluginapi.ConfigFieldTypeNumber, Default: 100, Description: "Default 5-hour utilization cap, 0 to 100. A reset window inside release_before does not lift this cap."},
+			{Name: "weekly_cap", Type: pluginapi.ConfigFieldTypeNumber, Default: 100, Description: "Default 7-day utilization cap, 0 to 100. Lifted inside each account's release window."},
+			{Name: "release_before", Type: pluginapi.ConfigFieldTypeString, Default: "5h", Description: "How long before the 7-day reset the weekly cap is lifted and the account is preferred. Default 5h."},
+			{Name: "session_ttl", Type: pluginapi.ConfigFieldTypeString, Default: "1h", Description: "Keep a session on the same eligible account. 0s disables affinity. Default 1h."},
+			{Name: "accounts", Type: pluginapi.ConfigFieldTypeObject, Description: "Per-account five_hour_cap, weekly_cap, and release_before. Omit a field to inherit the default."},
 		}},
-		map[string]bool{"scheduler": true, "management_api": true},
+		map[string]bool{"scheduler": true, "scheduler_across_priorities": true, "management_api": true},
 	}
 }
