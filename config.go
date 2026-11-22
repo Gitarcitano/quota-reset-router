@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,7 +14,7 @@ import (
 )
 
 const pluginID = "quota-reset-router"
-const pluginVersion = "0.5.0"
+const pluginVersion = "0.6.0"
 
 const maxReserve = 95
 
@@ -32,10 +33,14 @@ type config struct {
 	// AccountsFile, when set, holds the reserves instead of Accounts. The file is re-read when
 	// it changes, so it can be shared between machines by a file sync tool.
 	AccountsFile string `yaml:"accounts_file" json:"-"`
+	// ManagementURL and ManagementKeyFile let the plugin copy the reserves from accounts_file
+	// back into this CPA's own config, so CPA's plugin settings screen shows what is in effect.
+	ManagementURL     string `yaml:"management_url" json:"-"`
+	ManagementKeyFile string `yaml:"management_key_file" json:"-"`
 }
 
 func decodeConfig(raw []byte) (config, error) {
-	cfg := config{Mode: "shadow", PollInterval: 30 * time.Minute, RequestTimeout: 10 * time.Second}
+	cfg := config{Mode: "shadow", PollInterval: 30 * time.Minute, RequestTimeout: 10 * time.Second, ManagementURL: "http://127.0.0.1:8317"}
 	if len(raw) != 0 {
 		// Unknown keys (including the removed caps and session settings) are ignored.
 		if err := yaml.Unmarshal(raw, &cfg); err != nil {
@@ -60,6 +65,16 @@ func decodeConfig(raw []byte) (config, error) {
 			return config{}, err
 		}
 		cfg.AccountsFile = path
+	}
+	if cfg.ManagementKeyFile != "" {
+		path, err := expandPath(cfg.ManagementKeyFile)
+		if err != nil {
+			return config{}, errors.New("management_key_file must be an absolute path or start with ~/")
+		}
+		cfg.ManagementKeyFile = path
+	}
+	if u, err := url.Parse(cfg.ManagementURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return config{}, errors.New("management_url must be an http(s) URL")
 	}
 	return cfg, nil
 }

@@ -178,6 +178,7 @@ func (p *pluginRuntime) configure(cfg config) {
 	p.stopLocked()
 	p.fetcher = newHTTPFetcher()
 	e := newEngine(p.host, p.fetcher, cfg)
+	pushInlineEdit(old, e)
 	if old != nil {
 		e.inherit(old)
 	}
@@ -229,6 +230,8 @@ func registration() any {
 			{Name: "request_timeout", Type: pluginapi.ConfigFieldTypeString, Default: "10s", Description: "Usage poll timeout, 1s to 30s. Default 10s."},
 			{Name: "accounts", Type: pluginapi.ConfigFieldTypeObject, Description: "Per account (auth ID or email): five_hour_reserve and weekly_reserve, 0 to 95 percent kept unused while another account is available."},
 			{Name: "accounts_file", Type: pluginapi.ConfigFieldTypeString, Description: "Optional absolute path (or ~/...) of a YAML file with the accounts map. It replaces the inline accounts once read and is re-read when it changes, so it can be synced between machines."},
+			{Name: "management_url", Type: pluginapi.ConfigFieldTypeString, Default: "http://127.0.0.1:8317", Description: "This CPA's address, used with management_key_file to copy the reserves from accounts_file into these settings."},
+			{Name: "management_key_file", Type: pluginapi.ConfigFieldTypeString, Description: "Optional file holding this CPA's plaintext management key. With it, edits made on the other machine show up in these settings."},
 		}},
 		map[string]bool{"scheduler": true, "scheduler_across_priorities": true, "usage_plugin": true, "management_api": true},
 	}

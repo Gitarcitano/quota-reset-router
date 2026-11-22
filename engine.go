@@ -96,6 +96,7 @@ type engine struct {
 	fetcher  quotaFetcher
 	cfg      config
 	file     *reservesFile // nil unless accounts_file is set
+	mirrorAt atomic.Pointer[time.Time]
 	now      func() time.Time
 	mu       sync.Mutex
 	accounts map[string]*account
@@ -177,6 +178,7 @@ func (e *engine) tick(ctx context.Context) {
 		return
 	}
 	e.refreshReserves()
+	e.mirrorToConfig()
 	if !e.syncRoster() {
 		return
 	}

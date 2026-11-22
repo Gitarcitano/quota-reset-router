@@ -321,12 +321,12 @@ plugins:
         try:
             # a. The plugin registers and tracks both accounts.
             entry = wait_for(registered, "plugin registration")
-            assert entry["metadata"]["version"] == "0.5.0", entry["metadata"]
+            assert entry["metadata"]["version"] == "0.6.0", entry["metadata"]
             wait_for(
                 lambda: len(status()["accounts"]) == len(ids), "account discovery"
             )
             data = status()
-            assert data["mode"] == "shadow" and data["version"] == "0.5.0", data
+            assert data["mode"] == "shadow" and data["version"] == "0.6.0", data
 
             # b. Learn both accounts from response headers. With equal priorities
             # fill-first takes alpha, so beta is reached while alpha is disabled.
