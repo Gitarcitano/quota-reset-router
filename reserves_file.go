@@ -31,6 +31,7 @@ type reservesFile struct {
 	modTime  time.Time
 	size     int64
 	bad      bool // the version at modTime/size failed to parse
+	badErr   error
 	loaded   atomic.Pointer[map[string]accountReserve]
 	loadedAt atomic.Pointer[time.Time]
 	err      atomic.Pointer[string]
@@ -91,8 +92,10 @@ func (f *reservesFile) refreshLocked(force bool) bool {
 		return false
 	}
 	if !force && f.loaded.Load() != nil && info.ModTime().Equal(f.modTime) && info.Size() == f.size {
-		if !f.bad {
-			// The loaded version is back after a transient stat or read failure.
+		// The known version is back after a transient stat or read failure: report its own state.
+		if f.bad {
+			f.setError(f.badErr)
+		} else {
 			f.setError(nil)
 		}
 		return false
@@ -115,11 +118,11 @@ func (f *reservesFile) refreshLocked(force bool) bool {
 	accounts, err := parseReserves(raw)
 	if err != nil {
 		// Remember the bad version so it is not parsed again every pass; a later edit retries.
-		f.modTime, f.size, f.bad = info.ModTime(), info.Size(), true
+		f.modTime, f.size, f.bad, f.badErr = info.ModTime(), info.Size(), true, err
 		f.setError(err)
 		return false
 	}
-	f.modTime, f.size, f.bad = info.ModTime(), info.Size(), false
+	f.modTime, f.size, f.bad, f.badErr = info.ModTime(), info.Size(), false, nil
 	now := time.Now()
 	f.loaded.Store(&accounts)
 	f.loadedAt.Store(&now)

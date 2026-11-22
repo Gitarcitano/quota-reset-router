@@ -75,8 +75,9 @@ func accountsEqual(a, b map[string]accountReserve) bool {
 	return true
 }
 
-// mergeInlineEdit applies to file only the accounts that differ between the old and new inline
-// accounts: changed or added accounts take the new value, removed ones are deleted. It reports
+// mergeInlineEdit applies to file only what differs between the old and new inline accounts,
+// field by field: an edited field takes the new value, an untouched one keeps the file's, and
+// removed accounts are deleted. It reports
 // whether the result differs from file.
 func mergeInlineEdit(file, oldInline, newInline map[string]accountReserve) (map[string]accountReserve, bool) {
 	result := normalizeAccounts(file)
@@ -94,11 +95,20 @@ func mergeInlineEdit(file, oldInline, newInline map[string]accountReserve) (map[
 		if hadBefore == hasAfter && sameReserve(before, after) {
 			continue
 		}
-		if hasAfter {
-			result[key] = after
-		} else {
+		if !hasAfter {
 			delete(result, key)
+			continue
 		}
+		// Per field: a field that was not edited keeps whatever the file has, which may be newer
+		// than the value this caller saw.
+		current := result[key]
+		if !sameValue(before.FiveHourReserve, after.FiveHourReserve) {
+			current.FiveHourReserve = after.FiveHourReserve
+		}
+		if !sameValue(before.WeeklyReserve, after.WeeklyReserve) {
+			current.WeeklyReserve = after.WeeklyReserve
+		}
+		result[key] = current
 	}
 	return result, !accountsEqual(result, file)
 }

@@ -433,3 +433,40 @@ func TestSavingThroughASymlinkKeepsTheLink(t *testing.T) {
 		t.Fatalf("target not updated: %+v", got)
 	}
 }
+
+func TestSettingsEditKeepsTheOtherFieldOfTheAccount(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "reserves.yaml")
+	// The other machine raised the weekly reserve to 30; this machine's settings still say 15.
+	writeReserves(t, path, "accounts:\n  a@x.com:\n    five_hour_reserve: 10\n    weekly_reserve: 30\n", time.Now().Add(-time.Hour))
+	p := &pluginRuntime{host: &fakeHost{}}
+	defer p.stop()
+	head := "accounts_file: " + path + "\naccounts:\n  a@x.com:\n"
+	p.configure(mustConfig(t, head+"    five_hour_reserve: 10\n    weekly_reserve: 15\n"))
+	p.configure(mustConfig(t, head+"    five_hour_reserve: 20\n    weekly_reserve: 15\n")) // only the 5h value is edited
+	got := readReserves(t, path)["a@x.com"]
+	if *got.FiveHourReserve != 20 || *got.WeeklyReserve != 30 {
+		t.Fatalf("the untouched weekly reserve was overwritten with a stale value: %+v", got)
+	}
+}
+
+func TestFileErrorTracksTheKnownVersionAfterItReturns(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "reserves.yaml")
+	now := time.Now()
+	writeReserves(t, path, "accounts:\n  a:\n    weekly_reserve: 10\n", now.Add(-2*time.Hour))
+	f := newReservesFile(path)
+	f.refresh() // good version loaded
+	bad := now.Add(-time.Hour)
+	writeReserves(t, path, "accounts: [", bad)
+	f.refresh()
+	want := f.lastError()
+	if !strings.Contains(want, "not valid YAML") {
+		t.Fatalf("unexpected error %q", want)
+	}
+	os.Remove(path)
+	f.refresh()
+	writeReserves(t, path, "accounts: [", bad) // the same invalid version comes back
+	f.refresh()
+	if f.lastError() != want {
+		t.Fatalf("status says %q for a file that is invalid, not missing", f.lastError())
+	}
+}
