@@ -125,7 +125,8 @@ async function save() {
   message.textContent = "Salvando";
   if (accountsFile) {
     // Reserves go to the shared file; mode and poll interval stay in this machine's config.
-    const saved = await fetch("/v0/management/plugins/quota-reset-router/accounts", { method: "POST", headers: headers(), body: JSON.stringify({ accounts }) });
+    // Sending what was loaded lets the plugin apply only the reserves edited here.
+    const saved = await fetch("/v0/management/plugins/quota-reset-router/accounts", { method: "POST", headers: headers(), body: JSON.stringify({ accounts, previous: configured }) });
     if (!saved.ok) {
       let detail = String(saved.status);
       try { detail = (await saved.json()).error || detail; } catch (error) {}
@@ -136,7 +137,9 @@ async function save() {
     body.accounts = accounts;
   }
   const response = await fetch("/v0/management/plugins/quota-reset-router/config", { method: "PATCH", headers: headers(), body: JSON.stringify(body) });
-  message.textContent = response.ok ? "Configuracao salva. O proxy recarrega o plugin." : "Nao foi possivel salvar (" + response.status + ")";
+  if (response.ok) message.textContent = "Configuracao salva. O proxy recarrega o plugin.";
+  else if (accountsFile) message.textContent = "Reservas salvas no arquivo compartilhado, mas modo e intervalo nao (" + response.status + ")";
+  else message.textContent = "Nao foi possivel salvar (" + response.status + ")";
   if (response.ok) setTimeout(load, 600);
 }
 document.querySelector("#load").addEventListener("click", () => load().catch((error) => { message.textContent = String(error); }));

@@ -119,6 +119,17 @@ func newEngine(host authHost, fetcher quotaFetcher, cfg config) *engine {
 	return e
 }
 
+// adoptFile keeps the reserves file state of the engine being replaced when both use the same
+// file, so a reconfigure while the file is missing or invalid keeps the last good reserves.
+// The old engine is already stopped when this runs.
+func (e *engine) adoptFile(old *engine) {
+	if old == nil || old.file == nil || e.file == nil || old.file.path != e.file.path {
+		return
+	}
+	e.file = old.file
+	e.file.refresh()
+}
+
 // config returns the configuration with the reserves in effect: those from accounts_file once
 // it was read successfully, otherwise the inline accounts.
 func (e *engine) config() config {

@@ -127,6 +127,9 @@ func (p *pluginRuntime) saveAccounts(body []byte) pluginapi.ManagementResponse {
 	}
 	var req struct {
 		Accounts map[string]accountReserve `json:"accounts"`
+		// Previous is what the caller saw before editing. With it, only the accounts the caller
+		// changed are applied, so an edit that arrived from the other machine in the meantime stays.
+		Previous map[string]accountReserve `json:"previous"`
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
 		return jsonResponse(http.StatusBadRequest, map[string]string{"error": "body must be {\"accounts\": {...}}"})
@@ -134,7 +137,19 @@ func (p *pluginRuntime) saveAccounts(body []byte) pluginapi.ManagementResponse {
 	if err := validateAccounts(req.Accounts); err != nil {
 		return jsonResponse(http.StatusBadRequest, map[string]string{"error": err.Error()})
 	}
-	if err := e.file.write(req.Accounts); err != nil {
+	accounts := req.Accounts
+	if req.Previous != nil {
+		current, loaded := e.file.accounts()
+		if !loaded {
+			return jsonResponse(http.StatusConflict, map[string]string{"error": "accounts_file was not read yet"})
+		}
+		merged, changed := mergeInlineEdit(current, req.Previous, req.Accounts)
+		if !changed {
+			return jsonResponse(http.StatusOK, e.status())
+		}
+		accounts = merged
+	}
+	if err := e.file.write(accounts); err != nil {
 		return jsonResponse(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 	}
 	e.host.Log("info", "quota-reset-router: reserves saved to accounts_file", map[string]any{"path": e.file.path})
@@ -178,6 +193,7 @@ func (p *pluginRuntime) configure(cfg config) {
 	p.stopLocked()
 	p.fetcher = newHTTPFetcher()
 	e := newEngine(p.host, p.fetcher, cfg)
+	e.adoptFile(old)
 	pushInlineEdit(old, e)
 	if old != nil {
 		e.inherit(old)

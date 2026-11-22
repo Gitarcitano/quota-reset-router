@@ -246,3 +246,71 @@ func TestFileEditIsCopiedToConfig(t *testing.T) {
 	case <-time.After(300 * time.Millisecond):
 	}
 }
+
+func TestReconfigureKeepsLastGoodReservesWhenFileIsGone(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "reserves.yaml")
+	writeReserves(t, path, "accounts:\n  a@example.com:\n    five_hour_reserve: 45\n", time.Now().Add(-time.Hour))
+	p := &pluginRuntime{host: &fakeHost{}}
+	defer p.stop()
+	cfg := mustConfig(t, "mode: active\naccounts_file: "+path)
+	p.configure(cfg)
+	os.Remove(path) // mid-sync, or deleted by mistake
+	p.configure(mustConfig(t, "mode: shadow\naccounts_file: "+path))
+	if r := p.active.Load().config().reserveFor("a", "a@example.com"); r.FiveHourReserve == nil || *r.FiveHourReserve != 45 {
+		t.Fatalf("reconfigure dropped the last good reserves: %+v", r)
+	}
+
+	// A settings edit while the file was never read on this machine must not create it.
+	fresh := filepath.Join(t.TempDir(), "never-synced.yaml")
+	q := &pluginRuntime{host: &fakeHost{}}
+	defer q.stop()
+	q.configure(mustConfig(t, "accounts_file: "+fresh+"\naccounts:\n  a:\n    weekly_reserve: 10"))
+	q.configure(mustConfig(t, "accounts_file: "+fresh+"\naccounts:\n  a:\n    weekly_reserve: 20"))
+	if _, err := os.Stat(fresh); !os.IsNotExist(err) {
+		t.Fatal("settings edit wrote a file this machine never read")
+	}
+}
+
+func TestPanelSaveKeepsEditsFromTheOtherMachine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "reserves.yaml")
+	writeReserves(t, path, "accounts:\n  a@example.com:\n    five_hour_reserve: 10\n  b@example.com:\n    weekly_reserve: 15\n", time.Now().Add(-time.Hour))
+	p := &pluginRuntime{}
+	e := fileEngine(t, path)
+	p.active.Store(e)
+	post := func(body string) pluginapi.ManagementResponse {
+		request, _ := json.Marshal(pluginapi.ManagementRequest{Method: "POST", Path: accountsPath, Body: []byte(body)})
+		var response pluginapi.ManagementResponse
+		decodeEnvelope(t, p.handle(pluginabi.MethodManagementHandle, request), &response)
+		return response
+	}
+	// The panel loaded a=10, b=15. Meanwhile the other machine set b to 30.
+	writeReserves(t, path, "accounts:\n  a@example.com:\n    five_hour_reserve: 10\n  b@example.com:\n    weekly_reserve: 30\n", time.Now())
+	e.refreshReserves()
+	loaded := `{"a@example.com":{"five_hour_reserve":10},"b@example.com":{"weekly_reserve":15}}`
+	if r := post(`{"previous":` + loaded + `,"accounts":{"a@example.com":{"five_hour_reserve":20},"b@example.com":{"weekly_reserve":15}}}`); r.StatusCode != 200 {
+		t.Fatalf("save failed: %d %s", r.StatusCode, r.Body)
+	}
+	got := readReserves(t, path)
+	if *got["a@example.com"].FiveHourReserve != 20 || *got["b@example.com"].WeeklyReserve != 30 {
+		t.Fatalf("panel save must change only what was edited here: %+v", got)
+	}
+}
+
+func TestFileErrorClearsWhenTheFileComesBack(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "reserves.yaml")
+	at := time.Now().Add(-time.Hour)
+	body := "accounts:\n  a:\n    weekly_reserve: 10\n"
+	writeReserves(t, path, body, at)
+	f := newReservesFile(path)
+	f.refresh()
+	os.Remove(path)
+	f.refresh()
+	if f.lastError() == "" {
+		t.Fatal("missing file not reported")
+	}
+	writeReserves(t, path, body, at) // same content and mtime: nothing to reload
+	f.refresh()
+	if f.lastError() != "" {
+		t.Fatalf("error stuck after the file came back: %s", f.lastError())
+	}
+}

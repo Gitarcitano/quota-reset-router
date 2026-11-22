@@ -95,8 +95,10 @@ func pushInlineEdit(old, next *engine) {
 	}
 	current, loaded := next.file.accounts()
 	if !loaded {
-		// Nothing to merge into: the inline accounts become the file.
-		current = map[string]accountReserve{}
+		// Writing into a file this machine never read (not synced yet, or invalid) would replace
+		// the reserves of both machines with this partial edit.
+		next.host.Log("warn", "quota-reset-router: settings edit not saved to accounts_file: the file was not read yet", map[string]any{"path": next.file.path})
+		return
 	}
 	merged, changed := mergeInlineEdit(current, old.cfg.Accounts, next.cfg.Accounts)
 	if !changed {

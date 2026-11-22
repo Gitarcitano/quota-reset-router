@@ -28,6 +28,7 @@ type reservesFile struct {
 	mu       sync.Mutex // serializes reads and writes of the file
 	modTime  time.Time
 	size     int64
+	bad      bool // the version at modTime/size failed to parse
 	loaded   atomic.Pointer[map[string]accountReserve]
 	loadedAt atomic.Pointer[time.Time]
 	err      atomic.Pointer[string]
@@ -88,6 +89,10 @@ func (f *reservesFile) refreshLocked(force bool) bool {
 		return false
 	}
 	if !force && f.loaded.Load() != nil && info.ModTime().Equal(f.modTime) && info.Size() == f.size {
+		if !f.bad {
+			// The loaded version is back after a transient stat or read failure.
+			f.setError(nil)
+		}
 		return false
 	}
 	if info.Size() > maxReservesFileSize {
@@ -108,11 +113,11 @@ func (f *reservesFile) refreshLocked(force bool) bool {
 	accounts, err := parseReserves(raw)
 	if err != nil {
 		// Remember the bad version so it is not parsed again every pass; a later edit retries.
-		f.modTime, f.size = info.ModTime(), info.Size()
+		f.modTime, f.size, f.bad = info.ModTime(), info.Size(), true
 		f.setError(err)
 		return false
 	}
-	f.modTime, f.size = info.ModTime(), info.Size()
+	f.modTime, f.size, f.bad = info.ModTime(), info.Size(), false
 	now := time.Now()
 	f.loaded.Store(&accounts)
 	f.loadedAt.Store(&now)
