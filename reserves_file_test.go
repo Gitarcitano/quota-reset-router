@@ -222,6 +222,13 @@ func TestFileEditIsCopiedToConfig(t *testing.T) {
 	e.tick(t.Context())
 	select {
 	case p := <-got:
+		t.Fatalf("a brand-new engine must wait before writing the config: %+v", p)
+	case <-time.After(300 * time.Millisecond):
+	}
+	e.created = e.created.Add(-mirrorSettle)
+	e.tick(t.Context())
+	select {
+	case p := <-got:
 		if p.auth != "Bearer s3cret" || p.path != "/v0/management/plugins/quota-reset-router/config" || *p.body["accounts"]["lorena@x.com"].FiveHourReserve != 50 {
 			t.Fatalf("bad config write: %+v", p)
 		}
@@ -231,6 +238,7 @@ func TestFileEditIsCopiedToConfig(t *testing.T) {
 
 	// Once the config matches the file, nothing is written.
 	e = newEngine(base.host, base.fetcher, mustConfig(t, settings+"50"))
+	e.created = e.created.Add(-mirrorSettle)
 	e.tick(t.Context())
 	select {
 	case p := <-got:

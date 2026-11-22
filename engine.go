@@ -97,6 +97,7 @@ type engine struct {
 	cfg      config
 	file     *reservesFile // nil unless accounts_file is set
 	mirrorAt atomic.Pointer[time.Time]
+	created  time.Time
 	now      func() time.Time
 	mu       sync.Mutex
 	accounts map[string]*account
@@ -110,7 +111,7 @@ type engine struct {
 }
 
 func newEngine(host authHost, fetcher quotaFetcher, cfg config) *engine {
-	e := &engine{host: host, fetcher: fetcher, cfg: cfg, now: time.Now, accounts: make(map[string]*account)}
+	e := &engine{host: host, fetcher: fetcher, cfg: cfg, now: time.Now, accounts: make(map[string]*account), created: time.Now()}
 	if cfg.AccountsFile != "" {
 		e.file = newReservesFile(cfg.AccountsFile)
 		e.file.refresh()

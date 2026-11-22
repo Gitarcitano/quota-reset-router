@@ -22,6 +22,10 @@ import (
 
 const mirrorRetry = 5 * time.Minute
 
+// mirrorSettle skips the copy while an engine is new: at startup CPA creates and replaces the
+// plugin a few times before its HTTP server listens, so an immediate PATCH would fail.
+const mirrorSettle = 10 * time.Second
+
 func normalizeAccounts(accounts map[string]accountReserve) map[string]accountReserve {
 	out := make(map[string]accountReserve, len(accounts))
 	for key, reserve := range accounts {
@@ -109,7 +113,7 @@ func pushInlineEdit(old, next *engine) {
 // inline accounts. It runs in its own goroutine because the write makes CPA reconfigure the
 // plugin, which waits for this engine's background loop to stop.
 func (e *engine) mirrorToConfig() {
-	if e.file == nil || e.cfg.ManagementKeyFile == "" {
+	if e.file == nil || e.cfg.ManagementKeyFile == "" || time.Since(e.created) < mirrorSettle {
 		return
 	}
 	accounts, loaded := e.file.accounts()
