@@ -282,7 +282,7 @@ def main():
             "quota polls",
         )
         data = status()
-        assert data["version"] == "0.4.0" and data["mode"] == "shadow", data
+        assert data["version"] == "0.5.0" and data["mode"] == "shadow", data
         assert "codex-ignored" not in data["accounts"], "Codex account tracked"
         planned = {i: data["accounts"][i]["planned_priority"] for i in claude_ids}
         assert planned == {

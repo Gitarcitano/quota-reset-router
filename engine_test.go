@@ -653,7 +653,7 @@ func TestStatusReportWithoutTokens(t *testing.T) {
 	e.pick(testRequest("a", "b"))
 	raw, _ := json.Marshal(e.status())
 	body := string(raw)
-	for _, want := range []string{`"version":"0.4.0"`, `"mode":"active"`, `"email":"a@example.com"`, `"five_hour_reserve":10`, `"weekly_reserve":15`, `"at_reserve":false`, `"planned_priority":`, `"last_write":"ok"`, `"source":"poll"`, `"age_seconds":0`, `"seven_day":`, `"configured_accounts"`} {
+	for _, want := range []string{`"version":"` + pluginVersion + `"`, `"mode":"active"`, `"email":"a@example.com"`, `"five_hour_reserve":10`, `"weekly_reserve":15`, `"at_reserve":false`, `"planned_priority":`, `"last_write":"ok"`, `"source":"poll"`, `"age_seconds":0`, `"seven_day":`, `"configured_accounts"`} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("status missing %s: %s", want, body)
 		}

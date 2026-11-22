@@ -95,6 +95,7 @@ type engine struct {
 	host     authHost
 	fetcher  quotaFetcher
 	cfg      config
+	file     *reservesFile // nil unless accounts_file is set
 	now      func() time.Time
 	mu       sync.Mutex
 	accounts map[string]*account
@@ -108,7 +109,37 @@ type engine struct {
 }
 
 func newEngine(host authHost, fetcher quotaFetcher, cfg config) *engine {
-	return &engine{host: host, fetcher: fetcher, cfg: cfg, now: time.Now, accounts: make(map[string]*account)}
+	e := &engine{host: host, fetcher: fetcher, cfg: cfg, now: time.Now, accounts: make(map[string]*account)}
+	if cfg.AccountsFile != "" {
+		e.file = newReservesFile(cfg.AccountsFile)
+		e.file.refresh()
+	}
+	return e
+}
+
+// config returns the configuration with the reserves in effect: those from accounts_file once
+// it was read successfully, otherwise the inline accounts.
+func (e *engine) config() config {
+	cfg := e.cfg
+	if e.file != nil {
+		if accounts, ok := e.file.accounts(); ok {
+			cfg.Accounts = accounts
+		}
+	}
+	return cfg
+}
+
+// refreshReserves re-reads accounts_file when it changed and logs the outcome.
+func (e *engine) refreshReserves() {
+	if e.file == nil {
+		return
+	}
+	before := e.file.lastError()
+	if e.file.refresh() {
+		e.host.Log("info", "quota-reset-router: reserves loaded from accounts_file", map[string]any{"path": e.file.path})
+	} else if after := e.file.lastError(); after != "" && after != before {
+		e.host.Log("warn", "quota-reset-router: "+after+"; keeping the last good reserves", map[string]any{"path": e.file.path})
+	}
 }
 
 // inherit copies what a replaced engine learned, so a reconfigure does not
@@ -142,7 +173,11 @@ func (e *engine) run(ctx context.Context) {
 func (e *engine) tick(ctx context.Context) {
 	e.tickMu.Lock()
 	defer e.tickMu.Unlock()
-	if ctx.Err() != nil || !e.syncRoster() {
+	if ctx.Err() != nil {
+		return
+	}
+	e.refreshReserves()
+	if !e.syncRoster() {
 		return
 	}
 	e.pollDue(ctx)
@@ -441,7 +476,7 @@ func (e *engine) applyPriorities() {
 		return
 	}
 	e.mu.Lock()
-	plan, known := planPriorities(e.accounts, e.cfg, e.now())
+	plan, known := planPriorities(e.accounts, e.config(), e.now())
 	e.mu.Unlock()
 	if !known {
 		return
@@ -575,7 +610,7 @@ func (e *engine) pick(req pluginapi.SchedulerPickRequest) pluginapi.SchedulerPic
 	var excluded []string
 	// A failed roster read leaves stale state behind, so it disables exclusions (fail-open).
 	if e.listErr == "" {
-		excluded = reserveExclusions(req.Candidates, e.accounts, e.cfg, now)
+		excluded = reserveExclusions(req.Candidates, e.accounts, e.config(), now)
 	}
 	e.last = pickRecord{At: now, Candidates: len(req.Candidates), WouldExclude: excluded, Applied: active && len(excluded) > 0}
 	e.mu.Unlock()
@@ -611,18 +646,19 @@ func (e *engine) status() any {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	now := e.now()
-	plan, known := planPriorities(e.accounts, e.cfg, now)
+	cfg := e.config()
+	plan, known := planPriorities(e.accounts, cfg, now)
 	planned := make(map[string]int, len(plan))
 	for _, row := range plan {
 		planned[row.ID] = row.Planned
 	}
 	accounts := make(map[string]accountReport, len(e.accounts))
 	for id, acc := range e.accounts {
-		reserve := e.cfg.reserveFor(acc.ID, acc.Email)
+		reserve := cfg.reserveFor(acc.ID, acc.Email)
 		report := accountReport{
 			ID: id, Email: acc.Email, Label: acc.Label, FiveHour: acc.FiveHour, Weekly: acc.Weekly, Source: acc.Source,
 			FiveHourReserve: reserve.FiveHourReserve, WeeklyReserve: reserve.WeeklyReserve,
-			AtReserve: acc.atReserve(e.cfg, now), Exhausted: acc.exhausted(now),
+			AtReserve: acc.atReserve(cfg, now), Exhausted: acc.exhausted(now),
 			Priority: acc.Priority, PlannedPriority: planned[id], LastWrite: acc.LastWrite, PollError: acc.PollError,
 		}
 		if !acc.ObservedAt.IsZero() {
@@ -652,5 +688,22 @@ func (e *engine) status() any {
 		Excluded       uint64                    `json:"excluded_picks"`
 		Writes         uint64                    `json:"priority_writes"`
 		WorkerFailed   bool                      `json:"worker_failed"`
-	}{pluginVersion, "priority_steering_with_reserve_exclusion", e.cfg.Mode, e.cfg.PollInterval.String(), e.cfg.RequestTimeout.String(), known, accounts, e.cfg.Accounts, e.listErr, e.last, e.picks.Load(), e.excluded.Load(), e.writes.Load(), e.failed.Load()}
+		AccountsFile   string                    `json:"accounts_file,omitempty"`
+		FileError      string                    `json:"accounts_file_error,omitempty"`
+		FileLoadedAt   *time.Time                `json:"accounts_file_loaded_at,omitempty"`
+	}{pluginVersion, "priority_steering_with_reserve_exclusion", cfg.Mode, cfg.PollInterval.String(), cfg.RequestTimeout.String(), known, accounts, cfg.Accounts, e.listErr, e.last, e.picks.Load(), e.excluded.Load(), e.writes.Load(), e.failed.Load(), fileField(e.file, (*reservesFile).pathValue), fileField(e.file, (*reservesFile).lastError), fileLoadedAt(e.file)}
+}
+
+func fileField(f *reservesFile, get func(*reservesFile) string) string {
+	if f == nil {
+		return ""
+	}
+	return get(f)
+}
+
+func fileLoadedAt(f *reservesFile) *time.Time {
+	if f == nil {
+		return nil
+	}
+	return f.lastLoad()
 }

@@ -12,6 +12,7 @@ import (
 )
 
 const statusPath = "/v0/management/plugins/" + pluginID + "/status"
+const accountsPath = "/v0/management/plugins/" + pluginID + "/accounts"
 const panelPath = "/v0/resource/plugins/" + pluginID + "/panel"
 
 type pluginRuntime struct {
@@ -77,7 +78,7 @@ func (p *pluginRuntime) handle(method string, raw []byte) []byte {
 		return success(struct{}{})
 	case pluginabi.MethodManagementRegister:
 		return success(pluginapi.ManagementRegistrationResponse{
-			Routes: []pluginapi.ManagementRoute{{Method: http.MethodGet, Path: statusPath}},
+			Routes: []pluginapi.ManagementRoute{{Method: http.MethodGet, Path: statusPath}, {Method: http.MethodPost, Path: accountsPath}},
 			Resources: []pluginapi.ResourceRoute{{
 				Path:        "/panel",
 				Menu:        "Cotas",
@@ -86,7 +87,13 @@ func (p *pluginRuntime) handle(method string, raw []byte) []byte {
 		})
 	case pluginabi.MethodManagementHandle:
 		var req pluginapi.ManagementRequest
-		if err := json.Unmarshal(raw, &req); err != nil || req.Method != http.MethodGet {
+		if err := json.Unmarshal(raw, &req); err != nil {
+			return success(pluginapi.ManagementResponse{StatusCode: http.StatusNotFound})
+		}
+		if req.Method == http.MethodPost && req.Path == accountsPath {
+			return success(p.saveAccounts(req.Body))
+		}
+		if req.Method != http.MethodGet {
 			return success(pluginapi.ManagementResponse{StatusCode: http.StatusNotFound})
 		}
 		if req.Path == panelPath {
@@ -104,6 +111,34 @@ func (p *pluginRuntime) handle(method string, raw []byte) []byte {
 	default:
 		return failure("unsupported_method")
 	}
+}
+
+func jsonResponse(code int, value any) pluginapi.ManagementResponse {
+	body, _ := json.Marshal(value)
+	return pluginapi.ManagementResponse{StatusCode: code, Headers: http.Header{"Content-Type": {"application/json"}, "Cache-Control": {"no-store"}}, Body: body}
+}
+
+// saveAccounts replaces the reserves in accounts_file. Without accounts_file the reserves live
+// in CPA's config and are saved through its own config endpoint instead.
+func (p *pluginRuntime) saveAccounts(body []byte) pluginapi.ManagementResponse {
+	e := p.active.Load()
+	if e == nil || e.file == nil {
+		return jsonResponse(http.StatusConflict, map[string]string{"error": "accounts_file is not configured"})
+	}
+	var req struct {
+		Accounts map[string]accountReserve `json:"accounts"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		return jsonResponse(http.StatusBadRequest, map[string]string{"error": "body must be {\"accounts\": {...}}"})
+	}
+	if err := validateAccounts(req.Accounts); err != nil {
+		return jsonResponse(http.StatusBadRequest, map[string]string{"error": err.Error()})
+	}
+	if err := e.file.write(req.Accounts); err != nil {
+		return jsonResponse(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+	}
+	e.host.Log("info", "quota-reset-router: reserves saved to accounts_file", map[string]any{"path": e.file.path})
+	return jsonResponse(http.StatusOK, e.status())
 }
 
 // pick delegates to CPA's selector. Any decode error or panic yields an empty response, so the
@@ -193,6 +228,7 @@ func registration() any {
 			{Name: "poll_interval", Type: pluginapi.ConfigFieldTypeString, Default: "30m", Description: "Poll the usage endpoint for accounts not observed for this long, 5m to 6h. Default 30m."},
 			{Name: "request_timeout", Type: pluginapi.ConfigFieldTypeString, Default: "10s", Description: "Usage poll timeout, 1s to 30s. Default 10s."},
 			{Name: "accounts", Type: pluginapi.ConfigFieldTypeObject, Description: "Per account (auth ID or email): five_hour_reserve and weekly_reserve, 0 to 95 percent kept unused while another account is available."},
+			{Name: "accounts_file", Type: pluginapi.ConfigFieldTypeString, Description: "Optional absolute path (or ~/...) of a YAML file with the accounts map. It replaces the inline accounts once read and is re-read when it changes, so it can be synced between machines."},
 		}},
 		map[string]bool{"scheduler": true, "scheduler_across_priorities": true, "usage_plugin": true, "management_api": true},
 	}
