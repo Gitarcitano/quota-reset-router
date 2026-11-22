@@ -26,7 +26,17 @@ const mirrorRetry = 5 * time.Minute
 // lastMirrored holds the reserves this plugin last wrote into CPA's config. The reconfigure
 // that follows that write is an echo, not a user edit, and must not be pushed back into the file
 // (the file may have moved on in the meantime).
-var lastMirrored atomic.Pointer[map[string]accountReserve]
+//
+// The marker is consumed by the first reconfigure that matches it, expires after mirrorEchoTTL,
+// and is dropped when the write fails, so a later edit that happens to equal it is a real edit.
+type mirrorMarker struct {
+	accounts map[string]accountReserve
+	at       time.Time
+}
+
+const mirrorEchoTTL = time.Minute
+
+var lastMirrored atomic.Pointer[mirrorMarker]
 
 // mirrorSettle skips the copy while an engine is new: at startup CPA creates and replaces the
 // plugin a few times before its HTTP server listens, so an immediate PATCH would fail.
@@ -99,8 +109,13 @@ func pushInlineEdit(old, next *engine) {
 	if old == nil || next.file == nil || accountsEqual(old.cfg.Accounts, next.cfg.Accounts) {
 		return
 	}
-	if echoed := lastMirrored.Load(); echoed != nil && accountsEqual(*echoed, next.cfg.Accounts) {
-		return
+	if echoed := lastMirrored.Load(); echoed != nil {
+		if time.Since(echoed.at) > mirrorEchoTTL {
+			lastMirrored.CompareAndSwap(echoed, nil)
+		} else if accountsEqual(echoed.accounts, next.cfg.Accounts) {
+			lastMirrored.CompareAndSwap(echoed, nil)
+			return
+		}
 	}
 	current, loaded := next.file.accounts()
 	if !loaded {
@@ -140,9 +155,11 @@ func (e *engine) mirrorToConfig() {
 		defer func() { _ = recover() }()
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		snapshot := normalizeAccounts(accounts)
-		lastMirrored.Store(&snapshot)
+		// Set before the PATCH: CPA may reconfigure the plugin before the response arrives.
+		marker := &mirrorMarker{accounts: normalizeAccounts(accounts), at: time.Now()}
+		lastMirrored.Store(marker)
 		if err := patchConfigAccounts(ctx, e.cfg.ManagementURL, e.cfg.ManagementKeyFile, accounts); err != nil {
+			lastMirrored.CompareAndSwap(marker, nil)
 			e.host.Log("warn", "quota-reset-router: reserves not copied to CPA config: "+err.Error(), nil)
 			return
 		}

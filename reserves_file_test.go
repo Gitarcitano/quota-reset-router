@@ -324,8 +324,7 @@ func TestMirrorEchoIsNotPushedBackIntoTheFile(t *testing.T) {
 	p.configure(mustConfig(t, head+"50"))
 	// The mirror wrote 55 into the config, then the other machine moved the file on to 60.
 	five := 55.0
-	snapshot := map[string]accountReserve{"a@x.com": {FiveHourReserve: &five}}
-	lastMirrored.Store(&snapshot)
+	lastMirrored.Store(&mirrorMarker{accounts: map[string]accountReserve{"a@x.com": {FiveHourReserve: &five}}, at: time.Now()})
 	defer lastMirrored.Store(nil)
 	p.configure(mustConfig(t, head+"55"))
 	if got := readReserves(t, path); *got["a@x.com"].FiveHourReserve != 60 {
@@ -382,5 +381,55 @@ func TestManagementURLMustBeLocal(t *testing.T) {
 		if _, err := decodeConfig([]byte("management_url: " + bad)); err == nil {
 			t.Fatalf("%s accepted", bad)
 		}
+	}
+}
+
+func TestUndoingAnEditAfterAMirrorIsNotAnEcho(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "reserves.yaml")
+	writeReserves(t, path, "accounts:\n  a@x.com:\n    five_hour_reserve: 50\n", time.Now().Add(-time.Hour))
+	p := &pluginRuntime{host: &fakeHost{}}
+	defer p.stop()
+	defer lastMirrored.Store(nil)
+	head := "accounts_file: " + path + "\naccounts:\n  a@x.com:\n    five_hour_reserve: "
+	p.configure(mustConfig(t, head+"40"))
+	five := 50.0
+	lastMirrored.Store(&mirrorMarker{accounts: map[string]accountReserve{"a@x.com": {FiveHourReserve: &five}}, at: time.Now()})
+	p.configure(mustConfig(t, head+"50")) // the mirror's echo: consumed
+	if lastMirrored.Load() != nil {
+		t.Fatal("echo marker not consumed")
+	}
+	p.configure(mustConfig(t, head+"70")) // the user edits
+	p.configure(mustConfig(t, head+"50")) // and undoes it: a real edit that equals the old marker
+	if got := readReserves(t, path); *got["a@x.com"].FiveHourReserve != 50 {
+		t.Fatalf("undo was swallowed as an echo: %+v", got)
+	}
+	// An expired marker is ignored too.
+	lastMirrored.Store(&mirrorMarker{accounts: map[string]accountReserve{"a@x.com": {FiveHourReserve: &five}}, at: time.Now().Add(-2 * mirrorEchoTTL)})
+	p.configure(mustConfig(t, head+"60"))
+	if got := readReserves(t, path); *got["a@x.com"].FiveHourReserve != 60 {
+		t.Fatalf("edit lost: %+v", got)
+	}
+}
+
+func TestSavingThroughASymlinkKeepsTheLink(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, "synced", "reserves.yaml")
+	os.MkdirAll(filepath.Dir(real), 0o700)
+	writeReserves(t, real, "accounts: {}\n", time.Now().Add(-time.Hour))
+	link := filepath.Join(dir, "link.yaml")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skip("symlinks unavailable")
+	}
+	f := newReservesFile(link)
+	f.refresh()
+	five := 10.0
+	if err := f.write(map[string]accountReserve{"a": {FiveHourReserve: &five}}); err != nil {
+		t.Fatal(err)
+	}
+	if info, _ := os.Lstat(link); info.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("the symlink was replaced by a regular file")
+	}
+	if got := readReserves(t, real); got["a"].FiveHourReserve == nil {
+		t.Fatalf("target not updated: %+v", got)
 	}
 }

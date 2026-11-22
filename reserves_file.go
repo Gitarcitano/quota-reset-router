@@ -157,7 +157,12 @@ func (f *reservesFile) write(accounts map[string]accountReserve) error {
 	raw := append([]byte("# Managed by quota-reset-router. Shared between machines; edits on either side are applied on both.\n"), body...)
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	dir, base := filepath.Split(f.path)
+	// Write through a symlink to its target, so the rename does not replace the link itself.
+	target := f.path
+	if resolved, err := filepath.EvalSymlinks(f.path); err == nil {
+		target = resolved
+	}
+	dir, base := filepath.Split(target)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return errors.New("accounts_file directory cannot be created")
 	}
@@ -181,7 +186,7 @@ func (f *reservesFile) write(accounts map[string]accountReserve) error {
 	if err := os.Chmod(tmp.Name(), 0o600); err != nil {
 		return errors.New("accounts_file cannot be written")
 	}
-	if err := os.Rename(tmp.Name(), f.path); err != nil {
+	if err := os.Rename(tmp.Name(), target); err != nil {
 		return errors.New("accounts_file cannot be written")
 	}
 	if !f.refreshLocked(true) {
