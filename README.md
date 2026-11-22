@@ -159,6 +159,7 @@ accounts:
 - Until the file is read successfully, the inline `accounts` apply. A missing or invalid file keeps the last good reserves, and the status shows `accounts_file_error`.
 - The **Cotas** panel saves the reserves to the file through `POST /v0/management/plugins/quota-reset-router/accounts` with `{"accounts": {...}}`. The write goes to a temp file named `.<name>.*.tmp` in the same directory and is then renamed, so sync tools never see a partial file. `mode` and `poll_interval` stay in each machine's own config.
 - Editing the reserves in CPA's own plugin settings also works. On reconfigure, the plugin saves to the file only the accounts whose values changed, so stale values for other accounts never overwrite the file. Removing an account there removes it from the file.
+- `management_url` must point to localhost, since it carries the management key.
 - With `management_key_file`, a file that differs from the inline `accounts` (an edit made on the other machine, or the file being newer at startup) is written into this CPA's config with `PATCH .../config {"accounts": ...}`, so the settings screen shows the reserves in effect. A failed write is retried every 5 minutes. Keep the key file at mode 600.
 
 Change settings without a restart (top-level keys are merged, so `accounts` is replaced as a whole):

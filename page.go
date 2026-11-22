@@ -131,6 +131,8 @@ async function save() {
       let detail = String(saved.status);
       try { detail = (await saved.json()).error || detail; } catch (error) {}
       message.textContent = "Nao foi possivel salvar as reservas (" + detail + ")";
+      // Mode and poll interval live in this machine's own config and can still be saved.
+      await fetch("/v0/management/plugins/quota-reset-router/config", { method: "PATCH", headers: headers(), body: JSON.stringify(body) });
       return;
     }
   } else {

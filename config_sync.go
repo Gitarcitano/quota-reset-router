@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -21,6 +22,11 @@ import (
 //     written back into this CPA's config through its management API.
 
 const mirrorRetry = 5 * time.Minute
+
+// lastMirrored holds the reserves this plugin last wrote into CPA's config. The reconfigure
+// that follows that write is an echo, not a user edit, and must not be pushed back into the file
+// (the file may have moved on in the meantime).
+var lastMirrored atomic.Pointer[map[string]accountReserve]
 
 // mirrorSettle skips the copy while an engine is new: at startup CPA creates and replaces the
 // plugin a few times before its HTTP server listens, so an immediate PATCH would fail.
@@ -93,6 +99,9 @@ func pushInlineEdit(old, next *engine) {
 	if old == nil || next.file == nil || accountsEqual(old.cfg.Accounts, next.cfg.Accounts) {
 		return
 	}
+	if echoed := lastMirrored.Load(); echoed != nil && accountsEqual(*echoed, next.cfg.Accounts) {
+		return
+	}
 	current, loaded := next.file.accounts()
 	if !loaded {
 		// Writing into a file this machine never read (not synced yet, or invalid) would replace
@@ -131,6 +140,8 @@ func (e *engine) mirrorToConfig() {
 		defer func() { _ = recover() }()
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
+		snapshot := normalizeAccounts(accounts)
+		lastMirrored.Store(&snapshot)
 		if err := patchConfigAccounts(ctx, e.cfg.ManagementURL, e.cfg.ManagementKeyFile, accounts); err != nil {
 			e.host.Log("warn", "quota-reset-router: reserves not copied to CPA config: "+err.Error(), nil)
 			return

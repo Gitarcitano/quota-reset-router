@@ -138,16 +138,17 @@ func (p *pluginRuntime) saveAccounts(body []byte) pluginapi.ManagementResponse {
 		return jsonResponse(http.StatusBadRequest, map[string]string{"error": err.Error()})
 	}
 	accounts := req.Accounts
-	if req.Previous != nil {
-		current, loaded := e.file.accounts()
-		if !loaded {
-			return jsonResponse(http.StatusConflict, map[string]string{"error": "accounts_file was not read yet"})
-		}
+	// The snapshot can be up to one pass old; pick up an edit the sync tool just delivered.
+	e.file.refresh()
+	if current, loaded := e.file.accounts(); req.Previous != nil && loaded {
 		merged, changed := mergeInlineEdit(current, req.Previous, req.Accounts)
 		if !changed {
 			return jsonResponse(http.StatusOK, e.status())
 		}
 		accounts = merged
+	} else if !loaded && e.file.lastError() != errFileMissing {
+		// Never read (not synced yet, or invalid): writing would replace the other machine's reserves.
+		return jsonResponse(http.StatusConflict, map[string]string{"error": "accounts_file was not read yet"})
 	}
 	if err := e.file.write(accounts); err != nil {
 		return jsonResponse(http.StatusInternalServerError, map[string]string{"error": err.Error()})

@@ -15,6 +15,8 @@ import (
 
 const maxReservesFileSize = 1 << 20
 
+const errFileMissing = "accounts_file not found"
+
 // reservesDocument is the shape of the accounts file.
 type reservesDocument struct {
 	Accounts map[string]accountReserve `yaml:"accounts"`
@@ -82,7 +84,7 @@ func (f *reservesFile) refreshLocked(force bool) bool {
 	info, err := os.Stat(f.path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			f.setError(errors.New("accounts_file not found"))
+			f.setError(errors.New(errFileMissing))
 		} else {
 			f.setError(errors.New("accounts_file cannot be read"))
 		}

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -73,10 +74,18 @@ func decodeConfig(raw []byte) (config, error) {
 		}
 		cfg.ManagementKeyFile = path
 	}
-	if u, err := url.Parse(cfg.ManagementURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return config{}, errors.New("management_url must be an http(s) URL")
+	if u, err := url.Parse(cfg.ManagementURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || !isLoopbackHost(u.Hostname()) {
+		return config{}, errors.New("management_url must be an http(s) URL on localhost, since it carries the management key")
 	}
 	return cfg, nil
+}
+
+func isLoopbackHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func validateAccounts(accounts map[string]accountReserve) error {

@@ -314,3 +314,73 @@ func TestFileErrorClearsWhenTheFileComesBack(t *testing.T) {
 		t.Fatalf("error stuck after the file came back: %s", f.lastError())
 	}
 }
+
+func TestMirrorEchoIsNotPushedBackIntoTheFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "reserves.yaml")
+	writeReserves(t, path, "accounts:\n  a@x.com:\n    five_hour_reserve: 60\n", time.Now().Add(-time.Hour))
+	p := &pluginRuntime{host: &fakeHost{}}
+	defer p.stop()
+	head := "accounts_file: " + path + "\naccounts:\n  a@x.com:\n    five_hour_reserve: "
+	p.configure(mustConfig(t, head+"50"))
+	// The mirror wrote 55 into the config, then the other machine moved the file on to 60.
+	five := 55.0
+	snapshot := map[string]accountReserve{"a@x.com": {FiveHourReserve: &five}}
+	lastMirrored.Store(&snapshot)
+	defer lastMirrored.Store(nil)
+	p.configure(mustConfig(t, head+"55"))
+	if got := readReserves(t, path); *got["a@x.com"].FiveHourReserve != 60 {
+		t.Fatalf("the mirror's reconfigure overwrote a newer file value: %+v", got)
+	}
+}
+
+func TestPanelSaveCreatesMissingFileAndRefusesUnreadOne(t *testing.T) {
+	dir := t.TempDir()
+	p := &pluginRuntime{}
+	post := func(body string) pluginapi.ManagementResponse {
+		request, _ := json.Marshal(pluginapi.ManagementRequest{Method: "POST", Path: accountsPath, Body: []byte(body)})
+		var response pluginapi.ManagementResponse
+		decodeEnvelope(t, p.handle(pluginabi.MethodManagementHandle, request), &response)
+		return response
+	}
+	body := `{"previous":{},"accounts":{"a@example.com":{"weekly_reserve":10}}}`
+
+	p.active.Store(fileEngine(t, filepath.Join(dir, "new.yaml")))
+	if r := post(body); r.StatusCode != 200 {
+		t.Fatalf("a missing file must be created: %d %s", r.StatusCode, r.Body)
+	}
+	broken := filepath.Join(dir, "broken.yaml")
+	writeReserves(t, broken, "accounts: [", time.Now())
+	p.active.Store(fileEngine(t, broken))
+	if r := post(body); r.StatusCode != 409 {
+		t.Fatalf("an unreadable file must not be overwritten: %d", r.StatusCode)
+	}
+}
+
+func TestPanelSaveSeesEditsNewerThanTheLastPass(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "reserves.yaml")
+	writeReserves(t, path, "accounts:\n  b@example.com:\n    weekly_reserve: 15\n", time.Now().Add(-time.Hour))
+	p := &pluginRuntime{}
+	p.active.Store(fileEngine(t, path))
+	// The other machine edits b after the last 30s pass; no refresh ran since.
+	writeReserves(t, path, "accounts:\n  b@example.com:\n    weekly_reserve: 30\n", time.Now())
+	request, _ := json.Marshal(pluginapi.ManagementRequest{Method: "POST", Path: accountsPath, Body: []byte(`{"previous":{"b@example.com":{"weekly_reserve":15}},"accounts":{"b@example.com":{"weekly_reserve":15},"a@example.com":{"weekly_reserve":5}}}`)})
+	var response pluginapi.ManagementResponse
+	decodeEnvelope(t, p.handle(pluginabi.MethodManagementHandle, request), &response)
+	got := readReserves(t, path)
+	if *got["b@example.com"].WeeklyReserve != 30 || *got["a@example.com"].WeeklyReserve != 5 {
+		t.Fatalf("stale snapshot overwrote a newer edit: %+v", got)
+	}
+}
+
+func TestManagementURLMustBeLocal(t *testing.T) {
+	for _, ok := range []string{"http://127.0.0.1:8317", "http://localhost:8317", "https://[::1]:8317"} {
+		if _, err := decodeConfig([]byte("management_url: " + ok)); err != nil {
+			t.Fatalf("%s rejected: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"http://example.com", "http://192.168.1.5:8317", "ftp://127.0.0.1", "127.0.0.1:8317"} {
+		if _, err := decodeConfig([]byte("management_url: " + bad)); err == nil {
+			t.Fatalf("%s accepted", bad)
+		}
+	}
+}
