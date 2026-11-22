@@ -51,6 +51,7 @@ const panelHTML = `<!DOCTYPE html>
 const keyEl = document.querySelector("#key");
 const message = document.querySelector("#message");
 let configured = {};
+let accountsFile = "";
 try { keyEl.value = sessionStorage.getItem("quota-reset-router-key") || ""; } catch (error) {}
 const headers = () => ({ "Authorization": "Bearer " + keyEl.value.trim(), "Content-Type": "application/json" });
 const pct = (w) => w && w.utilization != null ? w.utilization.toFixed(1) + "%" : "sem leitura";
@@ -80,6 +81,7 @@ async function load() {
   if (!response.ok) { message.textContent = "Nao foi possivel ler o status (" + response.status + ")"; return; }
   const status = await response.json();
   configured = status.configured_accounts || {};
+  accountsFile = status.accounts_file || "";
   document.querySelector("#mode").value = status.mode;
   document.querySelector("#poll").value = status.poll_interval;
   const body = document.querySelector("#accounts");
@@ -105,6 +107,7 @@ async function load() {
   }
   let note = rows.length ? "" : "Nenhuma conta Claude elegivel.";
   if (rows.length && !status.weekly_reset_known) note = "Nenhum reset semanal conhecido ainda. As prioridades nao serao alteradas.";
+  if (accountsFile) note = (note ? note + " " : "") + "Reservas no arquivo " + accountsFile + (status.accounts_file_error ? " (erro: " + status.accounts_file_error + ")" : "") + ".";
   if (status.worker_failed) note = "Erro interno: o plugin parou de excluir contas e de escrever prioridades.";
   message.textContent = note;
 }
@@ -118,10 +121,27 @@ async function save() {
     if (Object.keys(entry).length) accounts[row.dataset.key] = entry;
     else delete accounts[row.dataset.key];
   }
-  const body = { mode: document.querySelector("#mode").value, poll_interval: document.querySelector("#poll").value.trim() || "30m", accounts };
+  const body = { mode: document.querySelector("#mode").value, poll_interval: document.querySelector("#poll").value.trim() || "30m" };
   message.textContent = "Salvando";
+  if (accountsFile) {
+    // Reserves go to the shared file; mode and poll interval stay in this machine's config.
+    // Sending what was loaded lets the plugin apply only the reserves edited here.
+    const saved = await fetch("/v0/management/plugins/quota-reset-router/accounts", { method: "POST", headers: headers(), body: JSON.stringify({ accounts, previous: configured }) });
+    if (!saved.ok) {
+      let detail = String(saved.status);
+      try { detail = (await saved.json()).error || detail; } catch (error) {}
+      message.textContent = "Nao foi possivel salvar as reservas (" + detail + ")";
+      // Mode and poll interval live in this machine's own config and can still be saved.
+      await fetch("/v0/management/plugins/quota-reset-router/config", { method: "PATCH", headers: headers(), body: JSON.stringify(body) });
+      return;
+    }
+  } else {
+    body.accounts = accounts;
+  }
   const response = await fetch("/v0/management/plugins/quota-reset-router/config", { method: "PATCH", headers: headers(), body: JSON.stringify(body) });
-  message.textContent = response.ok ? "Configuracao salva. O proxy recarrega o plugin." : "Nao foi possivel salvar (" + response.status + ")";
+  if (response.ok) message.textContent = "Configuracao salva. O proxy recarrega o plugin.";
+  else if (accountsFile) message.textContent = "Reservas salvas no arquivo compartilhado, mas modo e intervalo nao (" + response.status + ")";
+  else message.textContent = "Nao foi possivel salvar (" + response.status + ")";
   if (response.ok) setTimeout(load, 600);
 }
 document.querySelector("#load").addEventListener("click", () => load().catch((error) => { message.textContent = String(error); }));

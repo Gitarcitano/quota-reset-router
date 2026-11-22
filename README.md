@@ -112,6 +112,9 @@ Restart CLIProxyAPI and run the [install check](#install-check). The plugin-leve
 | `poll_interval` | `30m` | `5m` to `6h` | Poll an account only when its last observation is older than this. Also the first poll backoff. |
 | `request_timeout` | `10s` | `1s` to `30s` | Timeout per poll. |
 | `accounts` | empty | map | Per-account reserves, keyed by credential ID or email. |
+| `accounts_file` | empty | absolute path or `~/...` | YAML file with the `accounts` map. Once read it replaces the inline `accounts`. |
+| `management_url` | `http://127.0.0.1:8317` | http(s) URL | This CPA's address, for copying the file's reserves into its config. |
+| `management_key_file` | empty | absolute path or `~/...` | File with this CPA's plaintext management key. Enables that copy. |
 
 Each `accounts` entry takes `five_hour_reserve` and `weekly_reserve`, both percentages from `0` to `95`. Email keys match case-insensitively. When both an ID key and an email key match, the ID key wins. Unknown keys, including the keys of 0.3.x, are ignored.
 
@@ -130,6 +133,34 @@ plugins:
           five_hour_reserve: 10
           weekly_reserve: 15
 ```
+
+### Sharing reserves between machines
+
+Set `accounts_file` to keep the reserves in their own file, for example one synced by Syncthing between two machines that each run CLIProxyAPI:
+
+```yaml
+plugins:
+  configs:
+    quota-reset-router:
+      enabled: true
+      mode: active
+      accounts_file: ~/cpa-shared/quota-reserves.yaml
+```
+
+```yaml
+# ~/cpa-shared/quota-reserves.yaml
+accounts:
+  me@example.com:
+    five_hour_reserve: 10
+    weekly_reserve: 15
+```
+
+- The plugin checks the file's size and modification time on every pass (30 seconds) and re-reads it when they change. No restart is needed.
+- Until the file is read successfully, the inline `accounts` apply. A missing or invalid file keeps the last good reserves, and the status shows `accounts_file_error`.
+- The **Cotas** panel saves the reserves to the file through `POST /v0/management/plugins/quota-reset-router/accounts` with `{"accounts": {...}}`. The write goes to a temp file named `.<name>.*.tmp` in the same directory and is then renamed, so sync tools never see a partial file. `mode` and `poll_interval` stay in each machine's own config.
+- Editing the reserves in CPA's own plugin settings also works. On reconfigure, the plugin saves to the file only the accounts whose values changed, so stale values for other accounts never overwrite the file. Removing an account there removes it from the file.
+- `management_url` must point to localhost, since it carries the management key.
+- With `management_key_file`, a file that differs from the inline `accounts` (an edit made on the other machine, or the file being newer at startup) is written into this CPA's config with `PATCH .../config {"accounts": ...}`, so the settings screen shows the reserves in effect. A failed write is retried every 5 minutes. Keep the key file at mode 600.
 
 Change settings without a restart (top-level keys are merged, so `accounts` is replaced as a whole):
 
@@ -156,7 +187,7 @@ Requires Management API authentication. Returns the same per-account data plus t
 
 ```sh
 CPA_MANAGEMENT_KEY=... scripts/check-installed.sh
-# quota-reset-router 0.4.0 registered, mode shadow
+# quota-reset-router 0.6.0 registered, mode shadow
 ```
 
 It reads `CPA_URL` (default `http://127.0.0.1:8317`) and `CPA_MANAGEMENT_KEY`, calls `GET /v8/management/plugins`, and exits non-zero unless `quota-reset-router` is listed with `registered: true`. The mode comes from the status endpoint. The key is never printed. It needs `curl` and `python3`.
