@@ -31,6 +31,19 @@ An account is at its reserve when, for the 5-hour or the 7-day window, utilizati
 
 Example: with `five_hour_reserve: 10`, the account stops taking new sessions at 90% of its 5-hour window, until that window resets or until it is the only account left.
 
+### Early release before the weekly reset
+
+Quota left when the 7-day window resets is lost, so near the reset the plugin lifts the weekly reserve early enough for routed traffic to spend what is left:
+
+- It measures the consumption rate: every rise of the 7-day utilization of an account that is taking traffic (not held at its reserve) is summed over the last 24 hours and divided by the wall-clock hours, idle hours included. A rise seen while an account is held is its owner's use and does not count. Until two hours were measured (after a restart, for example), the account's own average since its window began is used.
+- An account with a `weekly_reserve` is released at `reset - (100 - utilization) / rate`, but never earlier than `release_window` before the reset (default 24h).
+- From then until that window resets, the weekly reserve does not hold the account, so it takes traffic until the quota runs out. Since it is usually the account that resets first, it also leads the ranking. The 5-hour reserve still applies.
+- A release lasts for the window: a faster rate measured later does not take it back. The next window starts with the reserve in force again.
+
+Example: 89% used, reserve 15, reset at 16:00, measured rate 2 points per hour: 11 points left need 5h30, so the account is released at 10:30. The status shows `weekly_release_at`, `weekly_reserve_released` and `burn_rate_per_hour`.
+
+The rate is in points of each account's own quota, so with accounts on different plans it is an approximation.
+
 ### Quota data
 
 - **Response headers.** Every Claude response carries `anthropic-ratelimit-unified-5h-*` and `anthropic-ratelimit-unified-7d-*` (utilization as a fraction, reset as Unix seconds, status). The plugin reads them from CLIProxyAPI's usage records, with no extra requests.
@@ -112,6 +125,7 @@ Restart CLIProxyAPI and run the [install check](#install-check). The plugin-leve
 | `poll_interval` | `30m` | `5m` to `6h` | Poll an account only when its last observation is older than this. Also the first poll backoff. |
 | `request_timeout` | `10s` | `1s` to `30s` | Timeout per poll. |
 | `accounts` | empty | map | Per-account reserves, keyed by credential ID or email. |
+| `release_window` | `24h` | `0` to `72h` | How long before the weekly reset, at most, a weekly reserve can be released early. `0` turns early release off. |
 | `accounts_file` | empty | absolute path or `~/...` | YAML file with the `accounts` map. Once read it replaces the inline `accounts`. |
 | `management_url` | `http://127.0.0.1:8317` | http(s) URL | This CPA's address, for copying the file's reserves into its config. |
 | `management_key_file` | empty | absolute path or `~/...` | File with this CPA's plaintext management key. Enables that copy. |
@@ -187,7 +201,7 @@ Requires Management API authentication. Returns the same per-account data plus t
 
 ```sh
 CPA_MANAGEMENT_KEY=... scripts/check-installed.sh
-# quota-reset-router 0.6.0 registered, mode shadow
+# quota-reset-router 0.7.0 registered, mode shadow
 ```
 
 It reads `CPA_URL` (default `http://127.0.0.1:8317`) and `CPA_MANAGEMENT_KEY`, calls `GET /v8/management/plugins`, and exits non-zero unless `quota-reset-router` is listed with `registered: true`. The mode comes from the status endpoint. The key is never printed. It needs `curl` and `python3`.
