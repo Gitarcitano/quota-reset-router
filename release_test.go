@@ -58,8 +58,8 @@ func TestPlanRelease(t *testing.T) {
 	cfg := config{Accounts: map[string]accountReserve{"r": reserves(10, 15)}}
 	acc := &account{ID: "r", Weekly: win(89, 10*time.Hour)}
 	plan, ok := planRelease(acc, cfg, 2, true, 24*time.Hour, testNow)
-	if !ok || plan.RateSource != "measured" || plan.Lead != 5*time.Hour+30*time.Minute || !plan.At.Equal(testNow.Add(4*time.Hour+30*time.Minute)) {
-		t.Fatalf("11 points left at 2/h must release 5h30 before the reset: %+v", plan)
+	if !ok || plan.RateSource != "measured" || plan.Lead != 8*time.Hour+15*time.Minute || !plan.At.Equal(testNow.Add(time.Hour+45*time.Minute)) {
+		t.Fatalf("11 points left at 2/h need 5h30, 8h15 with the margin: %+v", plan)
 	}
 	if plan, _ := planRelease(acc, cfg, 0.1, true, 24*time.Hour, testNow); plan.Lead != 24*time.Hour {
 		t.Fatalf("a slow rate is capped at release_window: %+v", plan)
@@ -97,24 +97,24 @@ func TestEarlyReleaseLiftsTheWeeklyReserveUntilTheReset(t *testing.T) {
 	e.burn = newBurnMeter(testNow.Add(-24 * time.Hour))
 	e.burn.add(testNow.Add(-time.Hour), 48) // 2 points per hour over the last day
 	e.syncRoster()
-	setWindows(e, "b", win(5, time.Hour), win(89, 6*time.Hour))
+	setWindows(e, "b", win(5, time.Hour), win(89, 9*time.Hour))
 	setWindows(e, "a", win(5, time.Hour), win(50, 72*time.Hour))
 	setWindows(e, "c", win(5, time.Hour), win(50, 96*time.Hour))
 
-	// 11 points left at 2/h need 5h30; the reset is 6h away, so not yet.
+	// 11 points left at 2/h need 8h15 with the margin; the reset is 9h away, so not yet.
 	e.updateReleases()
 	if got := e.pick(testRequest("a", "b", "c")); !reflect.DeepEqual(got.ExcludeCandidates, []string{"b"}) {
-		t.Fatalf("b must stay held 6h before the reset: %+v", got)
+		t.Fatalf("b must stay held 9h before the reset: %+v", got)
 	}
 	status := statusJSON(t, e)
-	if !strings.Contains(status, `"weekly_release_at":"`+testNow.Add(30*time.Minute).Format(time.RFC3339)) || !strings.Contains(status, `"burn_rate_per_hour":2`) {
+	if !strings.Contains(status, `"weekly_release_at":"`+testNow.Add(45*time.Minute).Format(time.RFC3339)) || !strings.Contains(status, `"burn_rate_per_hour":2`) {
 		t.Fatalf("status must show the planned release and the rate: %s", status)
 	}
 
-	*now = testNow.Add(30 * time.Minute)
+	*now = testNow.Add(45 * time.Minute)
 	e.updateReleases()
 	if got := e.pick(testRequest("a", "b", "c")); len(got.ExcludeCandidates) != 0 {
-		t.Fatalf("b must be released 5h30 before the reset: %+v", got)
+		t.Fatalf("b must be released 8h15 before the reset: %+v", got)
 	}
 	plan, _ := planPriorities(e.accounts, e.config(), *now)
 	if plan[0].ID != "b" {
@@ -127,11 +127,11 @@ func TestEarlyReleaseLiftsTheWeeklyReserveUntilTheReset(t *testing.T) {
 	// A faster rate later does not take the release back, but the five-hour reserve still holds.
 	e.burn.add(*now, 200)
 	e.updateReleases()
-	setWindows(e, "b", win(95, time.Hour), win(93, 6*time.Hour))
+	setWindows(e, "b", win(95, time.Hour), win(93, 9*time.Hour))
 	if got := e.pick(testRequest("a", "b", "c")); !reflect.DeepEqual(got.ExcludeCandidates, []string{"b"}) {
 		t.Fatalf("the five-hour reserve must still apply: %+v", got)
 	}
-	setWindows(e, "b", win(5, time.Hour), win(93, 6*time.Hour))
+	setWindows(e, "b", win(5, time.Hour), win(93, 9*time.Hour))
 	e.updateReleases()
 	if got := e.pick(testRequest("a", "b", "c")); len(got.ExcludeCandidates) != 0 {
 		t.Fatalf("the release must last until the reset: %+v", got)
@@ -225,4 +225,27 @@ func statusJSON(t *testing.T, e *engine) string {
 		t.Fatal(err)
 	}
 	return string(raw)
+}
+
+// The usage poll reports the reset with a sub-second part that changes between polls, and the
+// headers in whole seconds: the same window must keep its release and its high-water mark.
+func TestResetJitterKeepsReleaseAndPeak(t *testing.T) {
+	e, _, _, _ := testEngine(t)
+	e.cfg.Accounts = map[string]accountReserve{"b": reserves(10, 15)}
+	e.burn = newBurnMeter(testNow.Add(-4 * time.Hour))
+	e.syncRoster()
+	reset := testNow.Add(time.Hour)
+	setWindows(e, "b", window{}, window{Utilization: ptr(89.0), ResetsAt: ptr(reset.Add(327187 * time.Microsecond))})
+	e.updateReleases()
+	acc := e.accounts["b"]
+	acc.Weekly = window{Utilization: ptr(90.0), ResetsAt: ptr(reset.Add(485688 * time.Microsecond))}
+	e.recordWeekly(acc, false, testNow)
+	acc.Weekly = window{Utilization: ptr(92.0), ResetsAt: ptr(reset)}
+	e.recordWeekly(acc, false, testNow)
+	if !acc.released(testNow) || acc.atReserve(e.config(), testNow) {
+		t.Fatal("a reset that differs by a fraction of a second is the same window")
+	}
+	if rate, _ := e.burn.rate(testNow); !near(rate, 0.5) {
+		t.Fatalf("2 points over 4h must be 0.5/h, got %v", rate)
+	}
 }

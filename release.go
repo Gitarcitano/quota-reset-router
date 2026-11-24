@@ -21,7 +21,22 @@ const (
 	burnMinSpan      = 2 * time.Hour
 	defaultMaxLead   = 24 * time.Hour
 	maxReleaseWindow = 72 * time.Hour
+	// releaseMargin stretches the time needed to spend what is left: the measured rate covers all
+	// routed traffic, but sessions bound to other accounts stay there, so the released account
+	// usually gets less. Releasing a bit early costs little; releasing late loses quota.
+	releaseMargin = 1.5
+	// resetTolerance treats two reset times this close as the same window: the usage poll reports
+	// the reset with a sub-second part that changes between polls, the headers in whole seconds.
+	resetTolerance = time.Minute
 )
+
+func sameWindow(a, b *time.Time) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	d := a.Sub(*b)
+	return d > -resetTolerance && d < resetTolerance
+}
 
 type burnEvent struct {
 	at    time.Time
@@ -84,7 +99,7 @@ func (e *engine) recordWeekly(acc *account, held bool, now time.Time) {
 		return
 	}
 	value := *w.Utilization
-	if acc.peakReset == nil || !acc.peakReset.Equal(*w.ResetsAt) {
+	if !sameWindow(acc.peakReset, w.ResetsAt) {
 		reset := *w.ResetsAt
 		acc.peakReset, acc.peak = &reset, value
 		return
@@ -100,7 +115,7 @@ func (e *engine) recordWeekly(acc *account, held bool, now time.Time) {
 
 // released reports whether the weekly reserve is lifted for the account's current window.
 func (a *account) released(now time.Time) bool {
-	return a.ReleasedUntil != nil && a.Weekly.live(now) && a.ReleasedUntil.Equal(*a.Weekly.ResetsAt)
+	return a.Weekly.live(now) && sameWindow(a.ReleasedUntil, a.Weekly.ResetsAt)
 }
 
 func measuredRate(rate float64, measured bool) *float64 {
@@ -118,7 +133,7 @@ type releasePlan struct {
 }
 
 // planRelease computes when the account's weekly reserve should be lifted: the reset minus the
-// time the measured rate needs to spend what is left, capped at maxLead. It returns false when
+// time the measured rate needs to spend what is left (stretched by releaseMargin), capped at maxLead. It returns false when
 // the account has no weekly reserve or no live weekly window.
 func planRelease(acc *account, cfg config, rate float64, measured bool, maxLead time.Duration, now time.Time) (releasePlan, bool) {
 	reserve := cfg.reserveFor(acc.ID, acc.Email)
@@ -138,7 +153,7 @@ func planRelease(acc *account, cfg config, rate float64, measured bool, maxLead 
 	if left := 100 - used; left <= 0 {
 		plan.Lead = 0
 	} else if plan.Rate > 0 {
-		lead := time.Duration(left / plan.Rate * float64(time.Hour))
+		lead := time.Duration(left / plan.Rate * releaseMargin * float64(time.Hour))
 		if lead < maxLead {
 			plan.Lead = lead
 		}

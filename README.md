@@ -36,11 +36,11 @@ Example: with `five_hour_reserve: 10`, the account stops taking new sessions at 
 Quota left when the 7-day window resets is lost, so near the reset the plugin lifts the weekly reserve early enough for routed traffic to spend what is left:
 
 - It measures the consumption rate: every rise of the 7-day utilization of an account that is taking traffic (not held at its reserve) is summed over the last 24 hours and divided by the wall-clock hours, idle hours included. A rise seen while an account is held is its owner's use and does not count. Until two hours were measured (after a restart, for example), the account's own average since its window began is used.
-- An account with a `weekly_reserve` is released at `reset - (100 - utilization) / rate`, but never earlier than `release_window` before the reset (default 24h).
+- An account with a `weekly_reserve` is released at `reset - 1.5 × (100 - utilization) / rate`, but never earlier than `release_window` before the reset (default 24h). The 1.5 margin is there because the rate covers all routed traffic, while sessions already bound to other accounts stay on them, so the released account usually gets less than the full rate.
 - From then until that window resets, the weekly reserve does not hold the account, so it takes traffic until the quota runs out. Since it is usually the account that resets first, it also leads the ranking. The 5-hour reserve still applies.
 - A release lasts for the window: a faster rate measured later does not take it back. The next window starts with the reserve in force again.
 
-Example: 89% used, reserve 15, reset at 16:00, measured rate 2 points per hour: 11 points left need 5h30, so the account is released at 10:30. The status shows `weekly_release_at`, `weekly_reserve_released` and `burn_rate_per_hour`.
+Example: 89% used, reserve 15, reset at 16:00, measured rate 2 points per hour: 11 points left need 5h30, 8h15 with the margin, so the account is released at 07:45. The status shows `weekly_release_at`, `weekly_reserve_released` and `burn_rate_per_hour`.
 
 The rate is in points of each account's own quota, so with accounts on different plans it is an approximation.
 
