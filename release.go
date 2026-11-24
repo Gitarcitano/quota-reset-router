@@ -28,6 +28,9 @@ const (
 	// resetTolerance treats two reset times this close as the same window: the usage poll reports
 	// the reset with a sub-second part that changes between polls, the headers in whole seconds.
 	resetTolerance = time.Minute
+	// minBurnStep ignores rises smaller than a rounding error: the headers give utilization as a
+	// fraction, so 0.44 becomes 44.00000000000001 where the poll says 44.
+	minBurnStep = 0.01
 )
 
 func sameWindow(a, b *time.Time) bool {
@@ -93,6 +96,8 @@ func (m *burnMeter) rate(now time.Time) (float64, bool) {
 // above the highest value seen in the same window counts, so a poll and a header that disagree
 // by a rounding step are not counted twice. A held account's rise is its owner's use, not
 // traffic this plugin routed, so it only moves the high-water mark. Callers hold e.mu.
+//
+// held must say whether the account was really left out of routing: see (*engine).held.
 func (e *engine) recordWeekly(acc *account, held bool, now time.Time) {
 	w := acc.Weekly
 	if w.Utilization == nil || w.ResetsAt == nil {
@@ -104,7 +109,7 @@ func (e *engine) recordWeekly(acc *account, held bool, now time.Time) {
 		acc.peakReset, acc.peak = &reset, value
 		return
 	}
-	if value <= acc.peak {
+	if value-acc.peak < minBurnStep {
 		return
 	}
 	if !held && e.burn != nil {
@@ -153,9 +158,9 @@ func planRelease(acc *account, cfg config, rate float64, measured bool, maxLead 
 	if left := 100 - used; left <= 0 {
 		plan.Lead = 0
 	} else if plan.Rate > 0 {
-		lead := time.Duration(left / plan.Rate * releaseMargin * float64(time.Hour))
-		if lead < maxLead {
-			plan.Lead = lead
+		// Compared in hours first: a tiny rate would overflow a Duration.
+		if hours := left / plan.Rate * releaseMargin; hours < maxLead.Hours() {
+			plan.Lead = time.Duration(hours * float64(time.Hour))
 		}
 	}
 	plan.At = acc.Weekly.ResetsAt.Add(-plan.Lead)
@@ -163,7 +168,8 @@ func planRelease(acc *account, cfg config, rate float64, measured bool, maxLead 
 }
 
 // updateReleases lifts the weekly reserve of the accounts whose release time arrived. A release
-// lasts until that window resets, so a later change of the rate does not take it back.
+// lasts until that window resets, so a later change of the rate does not take it back; a
+// release_window reduced below the time left does.
 func (e *engine) updateReleases() {
 	cfg := e.config()
 	now := e.now()
@@ -174,7 +180,7 @@ func (e *engine) updateReleases() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	for _, acc := range e.accounts {
-		if acc.ReleasedUntil != nil && (!acc.released(now) || cfg.ReleaseWindow <= 0) {
+		if acc.ReleasedUntil != nil && (!acc.released(now) || acc.ReleasedUntil.Sub(now) > cfg.ReleaseWindow) {
 			acc.ReleasedUntil = nil
 		}
 		if acc.ReleasedUntil != nil {
@@ -190,4 +196,18 @@ func (e *engine) updateReleases() {
 			"account": acc.Label, "resets_at": reset.Format(time.RFC3339), "rate_per_hour": plan.Rate, "rate_source": plan.RateSource,
 		})
 	}
+}
+
+// held reports whether the account is left out of routing right now: at its reserve, in active
+// mode, while another account is open. Otherwise it takes traffic like any other. Callers hold e.mu.
+func (e *engine) held(acc *account, cfg config, now time.Time) bool {
+	if cfg.Mode != "active" || !acc.atReserve(cfg, now) {
+		return false
+	}
+	for _, other := range e.accounts {
+		if other != acc && !other.atReserve(cfg, now) && !other.exhausted(now) {
+			return true
+		}
+	}
+	return false
 }

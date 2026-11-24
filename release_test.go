@@ -249,3 +249,66 @@ func TestResetJitterKeepsReleaseAndPeak(t *testing.T) {
 		t.Fatalf("2 points over 4h must be 0.5/h, got %v", rate)
 	}
 }
+
+// A rate made of float noise (a header's 44.00000000000001 after a poll's 44) must neither feed
+// the meter nor overflow the lead into a release days before the reset.
+func TestTinyRateNeverReleasesEarly(t *testing.T) {
+	cfg := config{Accounts: map[string]accountReserve{"r": reserves(10, 15)}}
+	acc := &account{ID: "r", Weekly: win(89, 6*24*time.Hour)}
+	plan, ok := planRelease(acc, cfg, 7e-15, true, 24*time.Hour, testNow)
+	if !ok || plan.Lead != 24*time.Hour || !plan.At.Equal(testNow.Add(5*24*time.Hour)) {
+		t.Fatalf("a tiny rate must cap at release_window: %+v", plan)
+	}
+	e, _, _, _ := testEngine(t)
+	e.burn = newBurnMeter(testNow.Add(-4 * time.Hour))
+	noisy := &account{ID: "a"}
+	for _, util := range []float64{44, 0.44 * 100, 44.005} {
+		noisy.Weekly = win(util, 48*time.Hour)
+		e.recordWeekly(noisy, false, testNow)
+	}
+	if rate, _ := e.burn.rate(testNow); rate != 0 {
+		t.Fatalf("rounding noise must not count as spend, got %v", rate)
+	}
+}
+
+func TestShorterReleaseWindowTakesBackARelease(t *testing.T) {
+	e, _, _, _ := testEngine(t)
+	e.cfg.Accounts = map[string]accountReserve{"b": reserves(10, 15)}
+	e.syncRoster()
+	setWindows(e, "b", window{}, win(89, 3*time.Hour))
+	e.updateReleases()
+	if !e.accounts["b"].released(testNow) {
+		t.Fatal("3h before the reset is inside the default 24h window")
+	}
+	e.cfg.ReleaseWindow = 2 * time.Hour
+	e.updateReleases()
+	if e.accounts["b"].released(testNow) {
+		t.Fatal("a release earlier than the new release_window must be taken back")
+	}
+}
+
+// An account at its reserve still takes traffic in shadow mode and when no other account is
+// open, so its rise is routed spend there.
+func TestHeldOnlyWhenReallyExcluded(t *testing.T) {
+	e, _, _, _ := testEngine(t)
+	e.cfg.Accounts = map[string]accountReserve{"a": reserves(0, 15), "b": reserves(0, 15), "c": reserves(0, 15)}
+	e.syncRoster()
+	for _, id := range []string{"a", "b", "c"} {
+		setWindows(e, id, window{}, win(90, 48*time.Hour))
+	}
+	cfg := e.config()
+	if e.held(e.accounts["a"], cfg, testNow) {
+		t.Fatal("with every account at its reserve none is excluded")
+	}
+	setWindows(e, "c", window{}, win(50, 48*time.Hour))
+	if !e.held(e.accounts["a"], cfg, testNow) {
+		t.Fatal("a is excluded while c is open")
+	}
+	cfg.Mode = "shadow"
+	if e.held(e.accounts["a"], cfg, testNow) {
+		t.Fatal("shadow mode never excludes")
+	}
+	if e.held(e.accounts["c"], e.config(), testNow) {
+		t.Fatal("an open account is not held")
+	}
+}

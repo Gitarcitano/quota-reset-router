@@ -308,7 +308,7 @@ func (e *engine) pollDue(ctx context.Context) {
 				recordPollFailure(current, err, now, e.cfg.PollInterval)
 			} else if current.ObservedAt.Equal(acc.ObservedAt) {
 				// A newer header observation wins over this poll result.
-				held := current.atReserve(cfg, now)
+				held := e.held(current, cfg, now)
 				current.FiveHour = windowFromQuota(snap.FiveHour, current.FiveHour)
 				current.Weekly = windowFromQuota(&snap.Weekly, current.Weekly)
 				current.Source, current.ObservedAt = "poll", now
@@ -393,7 +393,7 @@ func (e *engine) observeUsage(record pluginapi.UsageRecord) {
 	if acc == nil {
 		return
 	}
-	held := acc.atReserve(cfg, now)
+	held := e.held(acc, cfg, now)
 	defer e.recordWeekly(acc, held, now)
 	if fiveOK {
 		acc.FiveHour = mergeWindow(acc.FiveHour, five)
