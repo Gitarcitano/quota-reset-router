@@ -11,7 +11,7 @@ import (
 // reserve so the account is used until it runs out. The five-hour reserve still applies.
 //
 // The consumption rate is measured, not configured: every rise of the weekly utilization of an
-// account that is taking traffic (not held at its reserve) is summed over the last 24 hours and
+// account that this proxy routed traffic to is summed over the last 24 hours and
 // divided by wall-clock time, idle hours included, since the reset arrives on the clock. Until
 // two hours were measured, the released account's own average since its window started is used.
 
@@ -97,7 +97,8 @@ func (m *burnMeter) rate(now time.Time) (float64, bool) {
 // by a rounding step are not counted twice. A held account's rise is its owner's use, not
 // traffic this plugin routed, so it only moves the high-water mark. Callers hold e.mu.
 //
-// held must say whether the account was really left out of routing: see (*engine).held.
+// Header observations always count (only routed requests carry them). For polls, held comes from
+// (*engine).held, since a poll also sees the owner's own use.
 func (e *engine) recordWeekly(acc *account, held bool, now time.Time) {
 	w := acc.Weekly
 	if w.Utilization == nil || w.ResetsAt == nil {
@@ -198,8 +199,9 @@ func (e *engine) updateReleases() {
 	}
 }
 
-// held reports whether the account is left out of routing right now: at its reserve, in active
-// mode, while another account is open. Otherwise it takes traffic like any other. Callers hold e.mu.
+// held reports whether a poll's rise on the account is likely its owner's use: the account is at
+// its reserve, in active mode, while another account is open, so new sessions are kept off it.
+// Routed requests that still reach it are counted from their headers. Callers hold e.mu.
 func (e *engine) held(acc *account, cfg config, now time.Time) bool {
 	if cfg.Mode != "active" || !acc.atReserve(cfg, now) {
 		return false

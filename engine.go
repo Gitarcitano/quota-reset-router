@@ -386,15 +386,15 @@ func (e *engine) observeUsage(record pluginapi.UsageRecord) {
 		return
 	}
 	now := e.now()
-	cfg := e.config()
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	acc := e.accounts[record.AuthID]
 	if acc == nil {
 		return
 	}
-	held := e.held(acc, cfg, now)
-	defer e.recordWeekly(acc, held, now)
+	// Response headers come only from requests this proxy routed to the account, so every rise
+	// they show is routed spend, whatever the reserve says.
+	defer e.recordWeekly(acc, false, now)
 	if fiveOK {
 		acc.FiveHour = mergeWindow(acc.FiveHour, five)
 	}

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"math"
 	"net/http"
@@ -194,10 +195,41 @@ func TestObservedSpendFeedsTheRate(t *testing.T) {
 	}
 	usage("a", "0.40")
 	usage("a", "0.44")
-	usage("b", "0.86") // b at its reserve: its owner's use
+	// b is at its reserve, but a request carrying its headers was routed to it (a bound
+	// session, a cooldown elsewhere), so that spend is ours too.
+	usage("b", "0.86")
 	usage("b", "0.88")
-	if rate, ok := e.burn.rate(*now); !ok || !near(rate, 2) {
-		t.Fatalf("only a's 4 routed points over 2h count, got %v %v", rate, ok)
+	if rate, ok := e.burn.rate(*now); !ok || !near(rate, 3) {
+		t.Fatalf("a's 4 and b's 2 routed points over 2h must be 3/h, got %v %v", rate, ok)
+	}
+}
+
+// A poll sees the owner's own use too, so a rise on an account held at its reserve is not counted.
+func TestPolledRiseOnHeldAccountIsNotCounted(t *testing.T) {
+	host := &fakeHost{files: map[string]string{}, names: map[string]string{}}
+	for _, id := range []string{"a", "b"} {
+		host.entries = append(host.entries, claudeEntry(id, id+"@example.com", 0))
+		host.files["idx-"+id] = claudeFile("SECRET_TOKEN_" + id)
+	}
+	util := map[string]float64{"SECRET_TOKEN_a": 40, "SECRET_TOKEN_b": 86}
+	reset := testNow.Add(72 * time.Hour)
+	fetcher := fetchFunc(func(_ context.Context, c credential) (quotaSnapshot, error) {
+		return quotaSnapshot{Weekly: quotaWindow{Utilization: ptr(util[c.AccessToken]), ResetsAt: ptr(reset)}}, nil
+	})
+	cfg, _ := decodeConfig([]byte("mode: active"))
+	cfg.Accounts = map[string]accountReserve{"b": reserves(0, 15)}
+	e := newEngine(host, fetcher, cfg)
+	now := testNow
+	e.now = func() time.Time { return now }
+	e.burn = newBurnMeter(testNow.Add(-2 * time.Hour))
+	e.syncRoster()
+	e.pollDue(context.Background())
+	util["SECRET_TOKEN_a"], util["SECRET_TOKEN_b"] = 42, 90
+	now = now.Add(cfg.PollInterval)
+	e.burn = newBurnMeter(now.Add(-2 * time.Hour))
+	e.pollDue(context.Background())
+	if rate, ok := e.burn.rate(now); !ok || !near(rate, 1) {
+		t.Fatalf("only a's 2 polled points over 2h count, got %v %v", rate, ok)
 	}
 }
 
