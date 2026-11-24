@@ -97,7 +97,10 @@ async function load() {
     row.children[3].textContent = (account.source || "-") + "\n" + age(account.age_seconds);
     row.children[4].firstChild.value = account.five_hour_reserve ?? "";
     row.children[5].firstChild.value = account.weekly_reserve ?? "";
-    row.children[6].textContent = account.at_reserve ? "sim" : (account.exhausted ? "esgotada" : "nao");
+    row.children[6].textContent = account.at_reserve ? "sim" : (account.exhausted ? "esgotada" : (account.weekly_reserve_released ? "liberada ate o reset" : "nao"));
+    if (!account.exhausted && account.weekly_release_at) {
+      row.children[6].textContent += "\nlibera " + new Date(account.weekly_release_at).toLocaleString("pt-BR", { weekday: "short", hour: "2-digit", minute: "2-digit" });
+    }
     row.children[6].className = account.at_reserve || account.exhausted ? "bad" : "ok";
     row.children[7].textContent = account.priority + " / " + account.planned_priority;
     row.children[8].textContent = account.last_write || "-";

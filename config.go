@@ -15,7 +15,7 @@ import (
 )
 
 const pluginID = "quota-reset-router"
-const pluginVersion = "0.6.0"
+const pluginVersion = "0.7.0"
 
 const maxReserve = 95
 
@@ -38,10 +38,15 @@ type config struct {
 	// back into this CPA's own config, so CPA's plugin settings screen shows what is in effect.
 	ManagementURL     string `yaml:"management_url" json:"-"`
 	ManagementKeyFile string `yaml:"management_key_file" json:"-"`
+	// ReleaseWindow is how long before the weekly reset, at most, an account's weekly reserve
+	// may be lifted so the quota left is spent instead of lost. 0 turns early release off.
+	ReleaseWindow time.Duration `yaml:"-" json:"-"`
+	// ReleaseWindowRaw is read as text so a bare 0 (no unit) is accepted.
+	ReleaseWindowRaw string `yaml:"release_window" json:"-"`
 }
 
 func decodeConfig(raw []byte) (config, error) {
-	cfg := config{Mode: "shadow", PollInterval: 30 * time.Minute, RequestTimeout: 10 * time.Second, ManagementURL: "http://127.0.0.1:8317"}
+	cfg := config{Mode: "shadow", PollInterval: 30 * time.Minute, RequestTimeout: 10 * time.Second, ManagementURL: "http://127.0.0.1:8317", ReleaseWindow: defaultMaxLead}
 	if len(raw) != 0 {
 		// Unknown keys (including the removed caps and session settings) are ignored.
 		if err := yaml.Unmarshal(raw, &cfg); err != nil {
@@ -56,6 +61,18 @@ func decodeConfig(raw []byte) (config, error) {
 	}
 	if cfg.RequestTimeout < time.Second || cfg.RequestTimeout > 30*time.Second {
 		return config{}, errors.New("request_timeout must be between 1s and 30s")
+	}
+	if raw := strings.TrimSpace(cfg.ReleaseWindowRaw); raw == "0" {
+		cfg.ReleaseWindow = 0
+	} else if raw != "" {
+		window, err := time.ParseDuration(raw)
+		if err != nil {
+			return config{}, errors.New("release_window must be a duration such as 24h, or 0")
+		}
+		cfg.ReleaseWindow = window
+	}
+	if cfg.ReleaseWindow < 0 || cfg.ReleaseWindow > maxReleaseWindow {
+		return config{}, errors.New("release_window must be between 0 and 72h")
 	}
 	if err := validateAccounts(cfg.Accounts); err != nil {
 		return config{}, err

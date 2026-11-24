@@ -72,12 +72,17 @@ type account struct {
 	PollError   string
 	LastWrite   string
 	LastRefresh time.Time
+	// ReleasedUntil is the weekly reset up to which the weekly reserve is lifted (early release).
+	ReleasedUntil *time.Time
+	// peak and peakReset hold the highest weekly utilization seen in the current window.
+	peak      float64
+	peakReset *time.Time
 }
 
 func (a *account) atReserve(cfg config, now time.Time) bool {
 	r := cfg.reserveFor(a.ID, a.Email)
 	return r.FiveHourReserve != nil && a.FiveHour.atLeast(100-*r.FiveHourReserve, now) ||
-		r.WeeklyReserve != nil && a.Weekly.atLeast(100-*r.WeeklyReserve, now)
+		r.WeeklyReserve != nil && !a.released(now) && a.Weekly.atLeast(100-*r.WeeklyReserve, now)
 }
 
 func (a *account) exhausted(now time.Time) bool {
@@ -96,6 +101,7 @@ type engine struct {
 	fetcher  quotaFetcher
 	cfg      config
 	file     *reservesFile // nil unless accounts_file is set
+	burn     *burnMeter
 	mirrorAt atomic.Pointer[time.Time]
 	created  time.Time
 	now      func() time.Time
@@ -111,7 +117,7 @@ type engine struct {
 }
 
 func newEngine(host authHost, fetcher quotaFetcher, cfg config) *engine {
-	e := &engine{host: host, fetcher: fetcher, cfg: cfg, now: time.Now, accounts: make(map[string]*account), created: time.Now()}
+	e := &engine{host: host, fetcher: fetcher, cfg: cfg, now: time.Now, accounts: make(map[string]*account), created: time.Now(), burn: newBurnMeter(time.Now())}
 	if cfg.AccountsFile != "" {
 		e.file = newReservesFile(cfg.AccountsFile)
 		e.file.refresh()
@@ -166,6 +172,9 @@ func (e *engine) inherit(old *engine) {
 		copied := *acc
 		e.accounts[id] = &copied
 	}
+	if old.burn != nil {
+		e.burn = old.burn
+	}
 }
 
 func (e *engine) run(ctx context.Context) {
@@ -196,6 +205,7 @@ func (e *engine) tick(ctx context.Context) {
 	}
 	e.pollDue(ctx)
 	if ctx.Err() == nil {
+		e.updateReleases()
 		e.applyPriorities()
 	}
 }
@@ -290,6 +300,7 @@ func (e *engine) pollDue(ctx context.Context) {
 			return
 		}
 		now := e.now()
+		cfg := e.config()
 		e.mu.Lock()
 		current = e.accounts[acc.ID]
 		if current != nil && current.Index == acc.Index {
@@ -297,10 +308,12 @@ func (e *engine) pollDue(ctx context.Context) {
 				recordPollFailure(current, err, now, e.cfg.PollInterval)
 			} else if current.ObservedAt.Equal(acc.ObservedAt) {
 				// A newer header observation wins over this poll result.
+				held := e.held(current, cfg, now)
 				current.FiveHour = windowFromQuota(snap.FiveHour, current.FiveHour)
 				current.Weekly = windowFromQuota(&snap.Weekly, current.Weekly)
 				current.Source, current.ObservedAt = "poll", now
 				current.PollBackoff, current.NextPoll, current.PollError = 0, time.Time{}, ""
+				e.recordWeekly(current, held, now)
 			}
 		}
 		e.mu.Unlock()
@@ -379,6 +392,9 @@ func (e *engine) observeUsage(record pluginapi.UsageRecord) {
 	if acc == nil {
 		return
 	}
+	// Response headers come only from requests this proxy routed to the account, so every rise
+	// they show is routed spend, whatever the reserve says.
+	defer e.recordWeekly(acc, false, now)
 	if fiveOK {
 		acc.FiveHour = mergeWindow(acc.FiveHour, five)
 	}
@@ -647,6 +663,8 @@ type accountReport struct {
 	FiveHourReserve *float64   `json:"five_hour_reserve,omitempty"`
 	WeeklyReserve   *float64   `json:"weekly_reserve,omitempty"`
 	AtReserve       bool       `json:"at_reserve"`
+	Released        bool       `json:"weekly_reserve_released"`
+	ReleaseAt       *time.Time `json:"weekly_release_at,omitempty"`
 	Exhausted       bool       `json:"exhausted"`
 	Priority        int        `json:"priority"`
 	PlannedPriority int        `json:"planned_priority"`
@@ -661,6 +679,10 @@ func (e *engine) status() any {
 	defer e.mu.Unlock()
 	now := e.now()
 	cfg := e.config()
+	rate, measured := 0.0, false
+	if e.burn != nil {
+		rate, measured = e.burn.rate(now)
+	}
 	plan, known := planPriorities(e.accounts, cfg, now)
 	planned := make(map[string]int, len(plan))
 	for _, row := range plan {
@@ -672,8 +694,12 @@ func (e *engine) status() any {
 		report := accountReport{
 			ID: id, Email: acc.Email, Label: acc.Label, FiveHour: acc.FiveHour, Weekly: acc.Weekly, Source: acc.Source,
 			FiveHourReserve: reserve.FiveHourReserve, WeeklyReserve: reserve.WeeklyReserve,
-			AtReserve: acc.atReserve(cfg, now), Exhausted: acc.exhausted(now),
+			AtReserve: acc.atReserve(cfg, now), Released: acc.released(now), Exhausted: acc.exhausted(now),
 			Priority: acc.Priority, PlannedPriority: planned[id], LastWrite: acc.LastWrite, PollError: acc.PollError,
+		}
+		if release, ok := planRelease(acc, cfg, rate, measured, cfg.ReleaseWindow, now); ok && !report.Released {
+			at := release.At
+			report.ReleaseAt = &at
 		}
 		if !acc.ObservedAt.IsZero() {
 			observed := acc.ObservedAt
@@ -705,7 +731,9 @@ func (e *engine) status() any {
 		AccountsFile   string                    `json:"accounts_file,omitempty"`
 		FileError      string                    `json:"accounts_file_error,omitempty"`
 		FileLoadedAt   *time.Time                `json:"accounts_file_loaded_at,omitempty"`
-	}{pluginVersion, "priority_steering_with_reserve_exclusion", cfg.Mode, cfg.PollInterval.String(), cfg.RequestTimeout.String(), known, accounts, cfg.Accounts, e.listErr, e.last, e.picks.Load(), e.excluded.Load(), e.writes.Load(), e.failed.Load(), fileField(e.file, (*reservesFile).pathValue), fileField(e.file, (*reservesFile).lastError), fileLoadedAt(e.file)}
+		ReleaseWindow  string                    `json:"release_window"`
+		BurnRate       *float64                  `json:"burn_rate_per_hour,omitempty"`
+	}{pluginVersion, "priority_steering_with_reserve_exclusion", cfg.Mode, cfg.PollInterval.String(), cfg.RequestTimeout.String(), known, accounts, cfg.Accounts, e.listErr, e.last, e.picks.Load(), e.excluded.Load(), e.writes.Load(), e.failed.Load(), fileField(e.file, (*reservesFile).pathValue), fileField(e.file, (*reservesFile).lastError), fileLoadedAt(e.file), cfg.ReleaseWindow.String(), measuredRate(rate, measured)}
 }
 
 func fileField(f *reservesFile, get func(*reservesFile) string) string {
